@@ -1,3 +1,5 @@
+
+# --- BEGIN main.py ---
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -708,3 +710,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# --- END main.py ---
