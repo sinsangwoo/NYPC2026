@@ -21,10 +21,9 @@ wheels/
 *.egg
 
 # 게임 로그 (크기가 크고 많으므로 git에 올리지 않음)
-logs/raw/*.log
-!logs/raw/README.md
-!logs/analysis/README.md
-
+logs/raw/
+logs/analysis/
+ 
 # IDE
 .vscode/
 .idea/
