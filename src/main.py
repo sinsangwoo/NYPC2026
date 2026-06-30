@@ -654,46 +654,37 @@ def generate_candidates(S: GameState, M: GameMap, P: Paths, turn: int) -> list[A
     return candidates
 
 
+# from evaluation_function import EvaluationFunction, Weights
+# from action_selector import ActionSelector
+
+
 def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
-    """Strategy: simulate candidates and pick the best one."""
-    candidates = generate_candidates(S, M, P, turn)
-    best_score = -math.inf
-    best_a = candidates[0]
+    """Strategy: use evaluation function to pick the best candidate actions."""
+    from evaluation_function import EvaluationFunction, Weights
+    from action_selector import ActionSelector
+    weights = Weights()
+    eval_fn = EvaluationFunction(weights)
+    selector = ActionSelector(eval_fn)
 
     # Log initial state
     initial_data = {
         "gold": S.gold,
         "income": calculate_income(S, M),
         "upkeep": calculate_upkeep(S, M),
-        "candidates_generated": len(candidates)
     }
 
-    # Evaluate each candidate with sandbox simulation
-    for a in candidates:
-        # Create sandbox copy
-        sandbox = deep_copy_state(S)
-        # Simulate applying actions, then combat, then evening
-        # First, apply costs
-        # (We don't actually apply the commands here, just evaluate via static heuristic for now)
-        score = evaluate_state(sandbox, M, P, turn)
-        # Small adjustment to prefer taking reasonable actions
-        if a.train_n > 0 or a.moves or a.upgrades:
-            score += 1.0
-
-        if score > best_score:
-            best_score = score
-            best_a = a
+    # Select best actions
+    best_actions = selector.select_best_actions(S, M, P, turn)
 
     # Log decision
     log_decision(turn, {
         **initial_data,
-        "best_score": best_score,
-        "chosen_train": best_a.train_n,
-        "chosen_moves": len(best_a.moves),
-        "chosen_upgrades": len(best_a.upgrades)
+        "chosen_train": best_actions.train_n,
+        "chosen_moves": len(best_actions.moves),
+        "chosen_upgrades": len(best_actions.upgrades)
     })
 
-    return best_a
+    return best_actions
 
 
 def main() -> None:

@@ -14,8 +14,9 @@ from pathlib import Path
 # 실험 설정 (여기서 쉽게 변경하세요!
 
 # 플레이어 설정
-PLAYER_LEFT = "python tools/testing-tool/sample-code.py"   # LEFT 플레이어 실행 명령
-PLAYER_RIGHT = "python tools/testing-tool/sample-code.py"  # RIGHT 플레이어 실행 명령
+PLAYER_LEFT = "python submission.py"   # LEFT 플레이어 실행 명령
+PLAYER_RIGHT = "python submission.py"  # RIGHT 플레이어 실행 명령
+AI_NAME = "baseline"  # AI 이름 (로그 파일명에 사용)
 
 # 경기 설정
 TOTAL_MATCHES = 100  # 총 경기 수
@@ -23,7 +24,7 @@ START_SEED = 1      # 시작 시드 (각 경기마다 1씩 증가
 MATCH_TIMEOUT = 300   # 개별 경기 타임아웃 (초)
 
 # 로그 설정
-LOGS_DIR = "logs/raw"  # 로그 저장 폴더
+LOGS_DIR = "logs/baseline_benchmark"  # 로그 저장 폴더
 ########################################
 
 
@@ -32,11 +33,22 @@ def main():
     project_root = Path(__file__).parent.parent
     
     # 경로 설정
+    build_script = project_root / "build.py"
     testing_tool = project_root / "tools" / "testing-tool" / "testing-tool.py"
     logs_dir = project_root / LOGS_DIR
     
-    # logs/raw 디렉토리가 없으면 생성
+    # logs 디렉토리가 없으면 생성
     logs_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 1. Build 자동 실행
+    print("=== Build 시작...")
+    build_result = subprocess.run(
+        ["python", str(build_script)], cwd=project_root, capture_output=True, text=True)
+    if build_result.returncode != 0:
+        print(f"Build 실패: {build_result.stderr}")
+        return
+    print("Build 성공!")
+    print("-" * 50)
     
     success_count = 0
     failure_count = 0
@@ -55,8 +67,8 @@ def main():
         match_num = i + 1
         seed = START_SEED + i
         
-        # 로그 파일명 생성 (game_0001.log 형식)
-        log_filename = f"game_{match_num:04d}.log"
+        # 로그 파일명 생성 (AI이름_vs_AI이름_0001.log 형식)
+        log_filename = f"{AI_NAME}_vs_{AI_NAME}_{match_num:04d}.log"
         log_filepath = logs_dir / log_filename
         
         # 기존 로그가 있으면 건너뛰기

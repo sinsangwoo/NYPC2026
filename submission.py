@@ -1,7 +1,458 @@
-
-# --- BEGIN main.py ---
 #!/usr/bin/env python3
 from __future__ import annotations
+
+
+# --- BEGIN action_selector.py ---
+
+"""
+Action Selector Module for NYPC 2026 AI
+Selects the best candidate actions based on scores
+"""
+import math
+
+
+class ActionSelector:
+    def __init__(self, eval_fn: EvaluationFunction):
+        self.eval_fn = eval_fn
+
+    def select_best_actions(
+        self, S: GameState, M: GameMap, P: Paths, turn: int
+    ) -> Actions:
+        candidates = CandidateGenerator.generate_all_candidates(S, M, P)
+        best_score = -math.inf
+        best_actions = candidates[0]
+
+        for candidate in candidates:
+            # Check if candidate is affordable
+            total_cost = self._calculate_candidate_cost(S, M, P, candidate)
+            if S.gold < total_cost:
+                continue
+
+            score = self.eval_fn.evaluate_actions(S, M, P, candidate, turn)
+            # Prefer doing something to doing nothing
+            if candidate.train_n > 0 or candidate.moves or candidate.upgrades:
+                score += 0.1
+
+            if score > best_score:
+                best_score = score
+                best_actions = candidate
+
+        return best_actions
+
+    @staticmethod
+    def _calculate_candidate_cost(
+        S: GameState, M: GameMap, P: Paths, actions: Actions
+    ) -> int:
+        total_cost = 0
+
+        # Calculate move costs
+        for wid, target in actions.moves:
+            target_building = S.find_building(target)
+            cost = 0 if (target_building and target_building.side == M.my_side) else MOVE_COST
+            total_cost += cost
+
+        # Calculate train costs
+        total_cost += TRAIN_COST * actions.train_n
+
+        # Calculate upgrade costs
+        for region in actions.upgrades:
+            target_building = S.find_building(region)
+            if target_building is None:
+                cost = BASE_LEVELS[1].cost
+            elif target_building.type == BType.HQ:
+                max_level = len(HQ_LEVELS) - 1
+                if target_building.level < max_level:
+                    cost = target_building.upgrade_cost()
+                else:
+                    cost = 1000
+            else:
+                max_level = len(BASE_LEVELS) - 1
+                if target_building.level < max_level:
+                    cost = target_building.upgrade_cost()
+                else:
+                    cost = 500
+            total_cost += cost
+
+        return total_cost
+# --- END action_selector.py ---
+
+# --- BEGIN candidate_generator.py ---
+
+"""
+Candidate Action Generator Module for NYPC 2026 AI
+Generates possible candidate actions for the AI
+"""
+from dataclasses import dataclass
+from typing import Union, NamedTuple
+
+
+class CandidateMove(NamedTuple):
+    warrior_id: WarriorId
+    target_region: int
+
+
+class CandidateTrain(NamedTuple):
+    train_n: int
+
+
+class CandidateUpgrade(NamedTuple):
+    region: int
+
+
+CandidateAction = Union[CandidateMove, CandidateTrain, CandidateUpgrade]
+
+
+class CandidateGenerator:
+    @staticmethod
+    def generate_all_candidates(S: GameState, M: GameMap, P: Paths) -> list[Actions]:
+        """
+        Generate candidate actions as list of Actions instances.
+        Each Actions instance represents a set of actions for one turn.
+        """
+        candidates: list[Actions] = []
+
+        # Candidate: Do nothing
+        candidates.append(Actions())
+
+        # Get stationary warriors
+        my_stationary_warriors = [
+            w for w in S.warriors
+            if w.id.side == M.my_side and w.state == WState.STATIONARY
+        ]
+
+        # Generate move candidates for each warrior
+        if my_stationary_warriors:
+            for warrior in my_stationary_warriors:
+                for adj in M.adj[warrior.region]:
+                    move_candidate = Actions()
+                    move_candidate.moves.append((warrior.id, adj))
+                    candidates.append(move_candidate)
+                # Wait (no move) candidate already in "Do nothing"
+            # Also generate candidate where all warriors move towards enemy HQ
+            all_hq_move = Actions()
+            for w in my_stationary_warriors:
+                next_step = P.nxt[w.region][M.opp_hq]
+                if next_step != -1:
+                    all_hq_move.moves.append((w.id, next_step))
+            candidates.append(all_hq_move)
+
+        # Generate train candidates
+        my_hq = S.find_building(M.my_hq)
+        if my_hq and my_hq.level > 0:
+            train_cap = HQ_LEVELS[my_hq.level].train_cap
+            for n in range(0, min(train_cap, S.gold // TRAIN_COST) + 1):
+                if n > 0:
+                    train_candidate = Actions()
+                    train_candidate.train_n = n
+                    candidates.append(train_candidate)
+
+        # Generate upgrade candidates
+        # Strongholds without buildings
+        for sh in M.strongholds:
+            if S.find_building(sh) is None and S.gold >= BASE_LEVELS[1].cost:
+                has_allies = any(w.region == sh and w.id.side == M.my_side for w in S.warriors)
+                has_enemies = any(w.region == sh and w.id.side != M.my_side for w in S.warriors)
+                if has_allies and not has_enemies:
+                    upgrade_candidate = Actions()
+                    upgrade_candidate.upgrades.append(sh)
+                    candidates.append(upgrade_candidate)
+        # Own buildings to upgrade
+        for b in S.buildings:
+            if b.side == M.my_side:
+                max_level = HQ_MAX_LEVEL if b.type == BType.HQ else BASE_MAX_LEVEL
+                if b.level < max_level and S.gold >= b.upgrade_cost():
+                    upgrade_candidate = Actions()
+                    upgrade_candidate.upgrades.append(b.region)
+                    candidates.append(upgrade_candidate)
+
+        return candidates
+# --- END candidate_generator.py ---
+
+# --- BEGIN evaluation_function.py ---
+
+"""
+Evaluation Function Module for NYPC 2026 AI
+Calculates scores for candidate actions using features
+"""
+import math
+from dataclasses import dataclass
+
+
+@dataclass
+class Weights:
+    # Move weights
+    w_dist_to_enemy_hq: float = -10.0
+    w_dist_to_nearest_enemy: float = -5.0
+    w_adj_allies_count: float = 2.0
+    w_adj_enemies_count: float = -10.0
+    w_is_stronghold: float = 1.0
+    w_is_on_hq: float = 1000.0
+    w_is_hq_adjacent: float = 500.0
+    w_move_cost: float = -0.0
+    w_turns_remaining: float = 0.0
+    w_remaining_gold_after_action: float = 0.1
+
+    # Train weights
+    w_train_n: float = 50.0
+    w_train_cost: float = -0.01
+    w_train_remaining_gold: float = 0.1
+    w_train_turns_remaining: float = 0.0
+
+    # Upgrade weights
+    w_upgrade_is_stronghold: float = 200.0
+    w_upgrade_cost: float = -0.01
+    w_upgrade_remaining_gold: float = 0.1
+    w_upgrade_turns_remaining: float = 0.0
+
+
+import sys
+
+def debug_print(msg):
+    """Print debug message to stderr to avoid interfering with stdout commands"""
+    print(msg, file=sys.stderr)
+
+class EvaluationFunction:
+    def __init__(self, weights: Weights = Weights()):
+        self.weights = weights
+
+    def evaluate_move(self, features: MoveFeatures) -> float:
+        score = 0.0
+        debug_print(f"[FORENSICS-EVAL] [MOVE] Calculation:")
+        debug_print(f"[FORENSICS-EVAL]   - w_dist_to_enemy_hq ({self.weights.w_dist_to_enemy_hq}) × dist_to_enemy_hq ({features.dist_to_enemy_hq}) = {self.weights.w_dist_to_enemy_hq * features.dist_to_enemy_hq}")
+        score += self.weights.w_dist_to_enemy_hq * features.dist_to_enemy_hq
+        debug_print(f"[FORENSICS-EVAL]   - w_dist_to_nearest_enemy ({self.weights.w_dist_to_nearest_enemy}) × dist_to_nearest_enemy ({features.dist_to_nearest_enemy}) = {self.weights.w_dist_to_nearest_enemy * features.dist_to_nearest_enemy}")
+        score += self.weights.w_dist_to_nearest_enemy * features.dist_to_nearest_enemy
+        debug_print(f"[FORENSICS-EVAL]   - w_adj_allies_count ({self.weights.w_adj_allies_count}) × adj_allies_count ({features.adj_allies_count}) = {self.weights.w_adj_allies_count * features.adj_allies_count}")
+        score += self.weights.w_adj_allies_count * features.adj_allies_count
+        debug_print(f"[FORENSICS-EVAL]   - w_adj_enemies_count ({self.weights.w_adj_enemies_count}) × adj_enemies_count ({features.adj_enemies_count}) = {self.weights.w_adj_enemies_count * features.adj_enemies_count}")
+        score += self.weights.w_adj_enemies_count * features.adj_enemies_count
+        debug_print(f"[FORENSICS-EVAL]   - w_is_stronghold ({self.weights.w_is_stronghold}) × is_stronghold ({1 if features.is_stronghold else 0}) = {self.weights.w_is_stronghold * (1 if features.is_stronghold else 0)}")
+        score += self.weights.w_is_stronghold * (1 if features.is_stronghold else 0)
+        debug_print(f"[FORENSICS-EVAL]   - w_is_on_hq ({self.weights.w_is_on_hq}) × is_on_hq ({1 if features.is_on_hq else 0}) = {self.weights.w_is_on_hq * (1 if features.is_on_hq else 0)}")
+        score += self.weights.w_is_on_hq * (1 if features.is_on_hq else 0)
+        debug_print(f"[FORENSICS-EVAL]   - w_is_hq_adjacent ({self.weights.w_is_hq_adjacent}) × is_hq_adjacent ({1 if features.is_hq_adjacent else 0}) = {self.weights.w_is_hq_adjacent * (1 if features.is_hq_adjacent else 0)}")
+        score += self.weights.w_is_hq_adjacent * (1 if features.is_hq_adjacent else 0)
+        debug_print(f"[FORENSICS-EVAL]   - w_move_cost ({self.weights.w_move_cost}) × move_cost ({features.move_cost}) = {self.weights.w_move_cost * features.move_cost}")
+        score += self.weights.w_move_cost * features.move_cost
+        debug_print(f"[FORENSICS-EVAL]   - w_turns_remaining ({self.weights.w_turns_remaining}) × turns_remaining ({features.turns_remaining}) = {self.weights.w_turns_remaining * features.turns_remaining}")
+        score += self.weights.w_turns_remaining * features.turns_remaining
+        debug_print(f"[FORENSICS-EVAL]   - w_remaining_gold_after_action ({self.weights.w_remaining_gold_after_action}) × remaining_gold_after_action ({features.remaining_gold_after_action}) = {self.weights.w_remaining_gold_after_action * features.remaining_gold_after_action}")
+        score += self.weights.w_remaining_gold_after_action * features.remaining_gold_after_action
+        debug_print(f"[FORENSICS-EVAL] [MOVE] Total Score: {score}")
+
+        return score
+
+    def evaluate_train(self, features: TrainFeatures) -> float:
+        score = 0.0
+        debug_print(f"[FORENSICS-EVAL] [TRAIN] Calculation:")
+        debug_print(f"[FORENSICS-EVAL]   - w_train_n ({self.weights.w_train_n}) × train_n ({features.train_n}) = {self.weights.w_train_n * features.train_n}")
+        score += self.weights.w_train_n * features.train_n
+        debug_print(f"[FORENSICS-EVAL]   - w_train_cost ({self.weights.w_train_cost}) × train_cost ({features.train_cost}) = {self.weights.w_train_cost * features.train_cost}")
+        score += self.weights.w_train_cost * features.train_cost
+        debug_print(f"[FORENSICS-EVAL]   - w_train_remaining_gold ({self.weights.w_train_remaining_gold}) × remaining_gold_after_action ({features.remaining_gold_after_action}) = {self.weights.w_train_remaining_gold * features.remaining_gold_after_action}")
+        score += self.weights.w_train_remaining_gold * features.remaining_gold_after_action
+        debug_print(f"[FORENSICS-EVAL]   - w_train_turns_remaining ({self.weights.w_train_turns_remaining}) × turns_remaining ({features.turns_remaining}) = {self.weights.w_train_turns_remaining * features.turns_remaining}")
+        score += self.weights.w_train_turns_remaining * features.turns_remaining
+        debug_print(f"[FORENSICS-EVAL] [TRAIN] Total Score: {score}")
+
+        return score
+
+    def evaluate_upgrade(self, features: UpgradeFeatures) -> float:
+        score = 0.0
+        debug_print(f"[FORENSICS-EVAL] [UPGRADE] Calculation:")
+        debug_print(f"[FORENSICS-EVAL]   - w_upgrade_is_stronghold ({self.weights.w_upgrade_is_stronghold}) × is_stronghold ({1 if features.is_stronghold else 0}) = {self.weights.w_upgrade_is_stronghold * (1 if features.is_stronghold else 0)}")
+        score += self.weights.w_upgrade_is_stronghold * (1 if features.is_stronghold else 0)
+        debug_print(f"[FORENSICS-EVAL]   - w_upgrade_cost ({self.weights.w_upgrade_cost}) × upgrade_cost ({features.upgrade_cost}) = {self.weights.w_upgrade_cost * features.upgrade_cost}")
+        score += self.weights.w_upgrade_cost * features.upgrade_cost
+        debug_print(f"[FORENSICS-EVAL]   - w_upgrade_remaining_gold ({self.weights.w_upgrade_remaining_gold}) × remaining_gold_after_action ({features.remaining_gold_after_action}) = {self.weights.w_upgrade_remaining_gold * features.remaining_gold_after_action}")
+        score += self.weights.w_upgrade_remaining_gold * features.remaining_gold_after_action
+        debug_print(f"[FORENSICS-EVAL]   - w_upgrade_turns_remaining ({self.weights.w_upgrade_turns_remaining}) × turns_remaining ({features.turns_remaining}) = {self.weights.w_upgrade_turns_remaining * features.turns_remaining}")
+        score += self.weights.w_upgrade_turns_remaining * features.turns_remaining
+        debug_print(f"[FORENSICS-EVAL] [UPGRADE] Total Score: {score}")
+
+        return score
+
+    def evaluate_actions(
+        self, S: GameState, M: GameMap, P: Paths, actions: Actions, turn: int
+    ) -> float:
+        total_score = 0.0
+        debug_print(f"[FORENSICS-EVAL] === Evaluating Actions ===")
+
+        # Evaluate all moves in this action set
+        for wid, target in actions.moves:
+            warrior = S.find_warrior(wid)
+            if warrior:
+                features = FeatureCalculator.calculate_move_features(S, M, P, warrior, target, turn)
+                total_score += self.evaluate_move(features)
+
+        # Evaluate train in this action set
+        if actions.train_n > 0:
+            features = FeatureCalculator.calculate_train_features(S, M, P, actions.train_n, turn)
+            total_score += self.evaluate_train(features)
+
+        # Evaluate upgrades in this action set
+        for region in actions.upgrades:
+            features = FeatureCalculator.calculate_upgrade_features(S, M, P, region, turn)
+            total_score += self.evaluate_upgrade(features)
+
+        debug_print(f"[FORENSICS-EVAL] === Total Actions Score: {total_score} ===")
+        return total_score
+# --- END evaluation_function.py ---
+
+# --- BEGIN feature_calculator.py ---
+
+"""
+Feature Calculator Module for NYPC 2026 AI
+Calculates all required features for Evaluation Function
+"""
+import math
+from dataclasses import dataclass
+from typing import NamedTuple
+
+
+@dataclass
+class MoveFeatures:
+    dist_to_enemy_hq: float
+    dist_to_nearest_enemy: float
+    adj_allies_count: int
+    adj_enemies_count: int
+    is_stronghold: bool
+    is_hq_adjacent: bool
+    is_on_hq: bool
+    move_cost: int
+    turns_remaining: int
+    remaining_gold_after_action: int
+
+
+@dataclass
+class TrainFeatures:
+    train_n: int
+    train_cost: int
+    turns_remaining: int
+    remaining_gold_after_action: int
+
+
+@dataclass
+class UpgradeFeatures:
+    region: int
+    upgrade_cost: int
+    is_stronghold: bool
+    turns_remaining: int
+    remaining_gold_after_action: int
+
+
+class FeatureCalculator:
+    @staticmethod
+    def calculate_move_features(
+        S: GameState, M: GameMap, P: Paths,
+        warrior: Warrior, target_region: int, turn: int
+    ) -> MoveFeatures:
+        """Calculate features for a MOVE action."""
+        # Distance to enemy HQ
+        dist_to_enemy_hq = P.dist[target_region][M.opp_hq]
+        if math.isinf(dist_to_enemy_hq):
+            dist_to_enemy_hq = 1000.0
+
+        # Distance to nearest enemy
+        dist_to_nearest_enemy = math.inf
+        for w in S.warriors:
+            if w.id.side != M.my_side:
+                d = P.dist[target_region][w.region]
+                if not math.isinf(d) and d < dist_to_nearest_enemy:
+                    dist_to_nearest_enemy = d
+        if math.isinf(dist_to_nearest_enemy):
+            dist_to_nearest_enemy = 1000.0
+
+        # Adjacent allies and enemies
+        adj_allies_count = 0
+        adj_enemies_count = 0
+        for w in S.warriors:
+            if w.region == target_region:
+                if w.id.side == M.my_side:
+                    adj_allies_count += 1
+                else:
+                    adj_enemies_count += 1
+        # Also count allies moving to same target? Maybe later, let's keep simple now.
+
+        # Stronghold, HQ checks
+        is_stronghold = target_region in M.strongholds
+        is_hq_adjacent = target_region in M.adj[M.opp_hq]
+        is_on_hq = target_region == M.opp_hq
+
+        # Move cost
+        target_building = S.find_building(target_region)
+        move_cost = 0 if (target_building and target_building.side == M.my_side) else MOVE_COST
+
+        # Remaining turns
+        turns_remaining = 200 - turn
+
+        # Remaining gold after action
+        remaining_gold_after_action = S.gold - move_cost
+
+        return MoveFeatures(
+            dist_to_enemy_hq=dist_to_enemy_hq,
+            dist_to_nearest_enemy=dist_to_nearest_enemy,
+            adj_allies_count=adj_allies_count,
+            adj_enemies_count=adj_enemies_count,
+            is_stronghold=is_stronghold,
+            is_hq_adjacent=is_hq_adjacent,
+            is_on_hq=is_on_hq,
+            move_cost=move_cost,
+            turns_remaining=turns_remaining,
+            remaining_gold_after_action=remaining_gold_after_action
+        )
+
+    @staticmethod
+    def calculate_train_features(
+        S: GameState, M: GameMap, P: Paths, train_n: int, turn: int
+    ) -> TrainFeatures:
+        """Calculate features for a TRAIN action."""
+        train_cost = TRAIN_COST * train_n
+        turns_remaining = 200 - turn
+        remaining_gold_after_action = S.gold - train_cost
+
+        return TrainFeatures(
+            train_n=train_n,
+            train_cost=train_cost,
+            turns_remaining=turns_remaining,
+            remaining_gold_after_action=remaining_gold_after_action
+        )
+
+    @staticmethod
+    def calculate_upgrade_features(
+        S: GameState, M: GameMap, P: Paths, region: int, turn: int
+    ) -> UpgradeFeatures:
+        """Calculate features for an UPGRADE action."""
+        target_building = S.find_building(region)
+        if target_building is None:
+            upgrade_cost = BASE_LEVELS[1].cost
+        elif target_building.type == BType.HQ:
+            max_level = len(HQ_LEVELS) - 1
+            if target_building.level < max_level:
+                upgrade_cost = target_building.upgrade_cost()
+            else:
+                upgrade_cost = 1000  # HQ heal cost
+        else:
+            max_level = len(BASE_LEVELS) - 1
+            if target_building.level < max_level:
+                upgrade_cost = target_building.upgrade_cost()
+            else:
+                upgrade_cost = 500  # Base heal cost
+
+        is_stronghold = region in M.strongholds
+        turns_remaining = 200 - turn
+        remaining_gold_after_action = S.gold - upgrade_cost
+
+        return UpgradeFeatures(
+            region=region,
+            upgrade_cost=upgrade_cost,
+            is_stronghold=is_stronghold,
+            turns_remaining=turns_remaining,
+            remaining_gold_after_action=remaining_gold_after_action
+        )
+# --- END feature_calculator.py ---
+
+# --- BEGIN main.py ---
 
 import math
 import sys
@@ -656,46 +1107,79 @@ def generate_candidates(S: GameState, M: GameMap, P: Paths, turn: int) -> list[A
     return candidates
 
 
+# from evaluation_function import EvaluationFunction, Weights
+# from action_selector import ActionSelector
+
+
+import sys
+
+def debug_print(msg):
+    """Print debug message to stderr to avoid interfering with stdout commands"""
+    print(msg, file=sys.stderr)
+
 def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
-    """Strategy: simulate candidates and pick the best one."""
-    candidates = generate_candidates(S, M, P, turn)
-    best_score = -math.inf
-    best_a = candidates[0]
+    """Strategy: use evaluation function to pick the best candidate actions."""
+    weights = Weights()
+    eval_fn = EvaluationFunction(weights)
+    selector = ActionSelector(eval_fn)
 
     # Log initial state
     initial_data = {
         "gold": S.gold,
         "income": calculate_income(S, M),
         "upkeep": calculate_upkeep(S, M),
-        "candidates_generated": len(candidates)
     }
 
-    # Evaluate each candidate with sandbox simulation
-    for a in candidates:
-        # Create sandbox copy
-        sandbox = deep_copy_state(S)
-        # Simulate applying actions, then combat, then evening
-        # First, apply costs
-        # (We don't actually apply the commands here, just evaluate via static heuristic for now)
-        score = evaluate_state(sandbox, M, P, turn)
-        # Small adjustment to prefer taking reasonable actions
-        if a.train_n > 0 or a.moves or a.upgrades:
-            score += 1.0
+    # Print all candidates, features, and scores (Forensics Evidence)
+    debug_print(f"[FORENSICS] === TURN {turn} ===")
+    candidates = CandidateGenerator.generate_all_candidates(S, M, P)
+    debug_print(f"[FORENSICS] Candidate Count: {len(candidates)}")
+    
+    candidate_scores = []
+    for idx, candidate in enumerate(candidates):
+        debug_print(f"\n[FORENSICS] --- Candidate #{idx} ---")
+        debug_print(f"[FORENSICS] Train N: {candidate.train_n}")
+        debug_print(f"[FORENSICS] Moves: {candidate.moves}")
+        debug_print(f"[FORENSICS] Upgrades: {candidate.upgrades}")
+        
+        # Calculate and print cost
+        cost = selector._calculate_candidate_cost(S, M, P, candidate)
+        debug_print(f"[FORENSICS] Cost: {cost}")
+        debug_print(f"[FORENSICS] Affordable: {S.gold >= cost}")
+        
+        if S.gold >= cost:
+            score = eval_fn.evaluate_actions(S, M, P, candidate, turn)
+            # Prefer doing something to doing nothing
+            if candidate.train_n > 0 or candidate.moves or candidate.upgrades:
+                score += 0.1
+            candidate_scores.append((score, idx, candidate))
+            debug_print(f"[FORENSICS] Score: {score}")
+        else:
+            candidate_scores.append((-math.inf, idx, candidate))
+            debug_print(f"[FORENSICS] Score: -inf (Not Affordable)")
+    
+    # Sort candidates by score descending
+    candidate_scores.sort(key=lambda x: (-x[0], x[1]))
+    debug_print(f"\n[FORENSICS] === Sorted Candidates ===")
+    for rank, (score, idx, candidate) in enumerate(candidate_scores):
+        debug_print(f"[FORENSICS] Rank {rank} | Candidate #{idx} | Score: {score} | Train: {candidate.train_n} | Moves: {len(candidate.moves)} | Upgrades: {len(candidate.upgrades)}")
 
-        if score > best_score:
-            best_score = score
-            best_a = a
+    # Select best actions
+    best_actions = selector.select_best_actions(S, M, P, turn)
+    debug_print(f"\n[FORENSICS] === FINAL CHOICE ===")
+    debug_print(f"[FORENSICS] Train: {best_actions.train_n}")
+    debug_print(f"[FORENSICS] Moves: {best_actions.moves}")
+    debug_print(f"[FORENSICS] Upgrades: {best_actions.upgrades}")
 
     # Log decision
     log_decision(turn, {
         **initial_data,
-        "best_score": best_score,
-        "chosen_train": best_a.train_n,
-        "chosen_moves": len(best_a.moves),
-        "chosen_upgrades": len(best_a.upgrades)
+        "chosen_train": best_actions.train_n,
+        "chosen_moves": len(best_actions.moves),
+        "chosen_upgrades": len(best_actions.upgrades)
     })
 
-    return best_a
+    return best_actions
 
 
 def main() -> None:
@@ -710,5 +1194,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 # --- END main.py ---
