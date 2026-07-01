@@ -427,7 +427,296 @@ class EventTracker:
 
 
 # =============================================================================
-# 3. Metric Extractor 모듈: 순수 수치 추출
+# 3-2. Extended Metric Extractor 모듈: AI 행동 분석용 추가 메트릭
+# =============================================================================
+
+@dataclass
+class ExtendedMetrics:
+    """AI 행동 분석용 확장 메트릭 - 오프라인 로그 분석만"""
+    # Match ID
+    match_id: int
+
+    # ===== 1. MOVE 탈락률 =====
+    move_candidates_total: int       # 총 생성된 MOVE 후보 수 (affordable 기준)
+    move_selected_count: int          # 실제로 선택된 MOVE 횟수
+    move_rejection_rate: float       # 탈락률 = (생성 - 선택) / 생성
+
+    # ===== 2. TRAIN vs MOVE Score Gap =====
+    avg_train_top1_score: float      # TRAIN 후보의 평균 top1 score
+    avg_move_top1_score: float       # MOVE 후보의 평균 top1 score
+    avg_train_move_score_gap: float  # TRAIN - MOVE gap (양수 = TRAIN 우위)
+
+    # ===== 3. UPGRADE 조건 충족률 =====
+    upgrade_candidates_generated: int # 생성된 UPGRADE 후보 수
+    upgrade_selected_count: int      # 실제로 선택된 UPGRADE 횟수
+    upgrade_creation_selection_rate: float  # 생성 대비 선택률
+
+    # ===== 4. Gold/Income 시계열 =====
+    gold_start: int                  # 초기 금화
+    gold_end: int                   # 최종 금화
+    gold_depletion_rate: float       # 소진률 = (start - end) / start
+    avg_income: float                # 평균 수입
+    avg_upkeep: float                # 평균 유지비
+    avg_income_upkeep_delta: float   # 수입 - 유지비 (양수 = 흑자)
+    gold_min: int                    # 최소 금화
+    gold_max: int                    # 최대 금화
+
+    # ===== 5. Candidate Score 분산 =====
+    avg_candidate_score_std: float   # 평균候选 점수 표준편차 (결정 불확실성)
+    avg_top1_top2_gap: float         # Top1-Top2 Gap 평균
+
+    # ===== 6. Wait 선택률 =====
+    wait_select_count: int           # WAIT(아무것도 안 함) 선택 횟수
+    wait_select_rate: float         # WAIT 선택률 = wait / total_turns
+
+
+class ExtendedMetricExtractor:
+    """로그의 stderr JSON에서 AI 행위 분석용 메트릭 추출"""
+
+    @staticmethod
+    def _parse_stderr_json(log_path: Path) -> dict:
+        """로그 파일에서 stderr JSON 데이터 파싱"""
+        import json as _json
+        debug_data = {
+            "candidates_per_turn": [],   # [{"turn": int, "candidates": [...], "gold": int, ...}]
+            "gold_time_series": []       # [{"turn": int, "gold": int, "income": int, "upkeep": int}]
+        }
+
+        with open(log_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                for side in ["LEFT", "RIGHT"]:
+                    debug_prefix = f"# Debug {side}:"
+                    if line.startswith(debug_prefix):
+                        try:
+                            json_str = line[len(debug_prefix):].strip()
+                            obj = _json.loads(json_str)
+
+                            # gold/income/upkeep 수집 ("candidates" 유무와 무관하게)
+                            if "gold" in obj and "income" in obj and "upkeep" in obj and "turn" in obj:
+                                turn = obj["turn"]
+                                gold = obj.get("gold", 0)
+                                income = obj.get("income", 0)
+                                upkeep = obj.get("upkeep", 0)
+
+                                debug_data["gold_time_series"].append({
+                                    "turn": turn,
+                                    "side": side,
+                                    "gold": gold,
+                                    "income": income,
+                                    "upkeep": upkeep
+                                })
+
+                            # Candidate 목록 (turn 완료 후, candidates가 있는 경우만)
+                            if "candidates" in obj and "turn" in obj:
+                                turn = obj["turn"]
+                                candidates = obj["candidates"]
+                                gold = obj.get("gold", 0)
+                                income = obj.get("income", 0)
+                                upkeep = obj.get("upkeep", 0)
+
+                                debug_data["candidates_per_turn"].append({
+                                    "turn": turn,
+                                    "side": side,
+                                    "candidates": candidates,
+                                    "gold": gold,
+                                    "income": income,
+                                    "upkeep": upkeep
+                                })
+                        except (_json.JSONDecodeError, KeyError, ValueError):
+                            continue
+
+        return debug_data
+
+    @staticmethod
+    def extract(log_path: Path, match_id: int, events: MatchEvents) -> ExtendedMetrics:
+        """Extended Metrics 추출 - 오프라인 로그 분석만"""
+
+        # stderr JSON 파싱
+        debug_data = ExtendedMetricExtractor._parse_stderr_json(log_path)
+        candidates_per_turn = debug_data["candidates_per_turn"]
+        gold_ts = debug_data["gold_time_series"]
+
+        # ===== 1. MOVE 탈락률 =====
+        move_candidates_total = 0
+        move_selected_count = 0
+
+        for cd in candidates_per_turn:
+            turn = cd["turn"]
+            candidates = cd["candidates"]
+
+            # 이 턴에 선택된 action 찾기
+            chosen_train = 0
+            chosen_moves = 0
+            chosen_upgrades = 0
+
+            # events에서 선택된 명령 찾기
+            if turn in events.commands:
+                left_cmd, right_cmd = events.commands[turn]
+                # TRAIN 명령 파싱
+                for cmd in left_cmd.commands:
+                    if cmd.startswith("TRAIN"):
+                        try:
+                            chosen_train = int(cmd.split()[1])
+                        except:
+                            pass
+                for cmd in right_cmd.commands:
+                    if cmd.startswith("TRAIN"):
+                        try:
+                            chosen_train += int(cmd.split()[1])
+                        except:
+                            pass
+
+            # candidates에서 MOVE 관련 통계
+            for cand in candidates:
+                # affordable MOVE 후보 수 (train_n=0이고 moves가 있는 경우)
+                if cand.get("moves") and cand.get("affordable", False):
+                    move_candidates_total += 1
+
+            # 실제 선택된 MOVE 횟수 (events.moves에서)
+            if turn in events.moves:
+                move_selected_count += len(events.moves[turn])
+
+        move_rejection_rate = 0.0
+        if move_candidates_total > 0:
+            # 선택되지 않은 MOVE = 생성된 MOVE - 실제로 선택된 MOVE
+            # NOTE: move_candidates_total은 affordable인 candidate 수이고,
+            # 각 candidate는 1개의 move action을 표현. 실제로 선택된 move는 events.moves로 확인
+            # 탈락률 = 1 - (선택된 candidate 중 move가 있는 것 / 전체 move candidate)
+            pass  # 복잡하므로 아래에서 다시 계산
+
+        # ===== 2. TRAIN vs MOVE Score Gap =====
+        train_top1_scores = []
+        move_top1_scores = []
+
+        for cd in candidates_per_turn:
+            candidates = cd["candidates"]
+            # affordable candidate의 score만 분석
+            affordable = [c for c in candidates if c.get("affordable", False)]
+            if not affordable:
+                continue
+
+            # scores 정렬
+            scores = sorted([c["score"] for c in affordable], reverse=True)
+
+            # TRAIN 후보와 MOVE 후보 분류
+            for cand in affordable:
+                if cand.get("train_n", 0) > 0:
+                    train_top1_scores.append(cand["score"])
+                elif cand.get("moves"):
+                    move_top1_scores.append(cand["score"])
+
+        avg_train_top1_score = sum(train_top1_scores) / len(train_top1_scores) if train_top1_scores else 0.0
+        avg_move_top1_score = sum(move_top1_scores) / len(move_top1_scores) if move_top1_scores else 0.0
+        avg_train_move_score_gap = avg_train_top1_score - avg_move_top1_score
+
+        # ===== 3. UPGRADE 조건 충족률 =====
+        upgrade_candidates_generated = 0
+        upgrade_selected_count = 0
+
+        for cd in candidates_per_turn:
+            candidates = cd["candidates"]
+            turn = cd["turn"]
+
+            for cand in candidates:
+                if cand.get("upgrades") and cand.get("affordable", False):
+                    upgrade_candidates_generated += 1
+
+            if turn in events.upgrades:
+                upgrade_selected_count += len(events.upgrades[turn])
+
+        upgrade_creation_selection_rate = 0.0
+        if upgrade_candidates_generated > 0:
+            upgrade_creation_selection_rate = upgrade_selected_count / upgrade_candidates_generated
+
+        # ===== 4. Gold/Income 시계열 =====
+        gold_values = [g["gold"] for g in gold_ts]
+        income_values = [g["income"] for g in gold_ts]
+        upkeep_values = [g["upkeep"] for g in gold_ts]
+
+        gold_start = gold_values[0] if gold_values else 500
+        gold_end = gold_values[-1] if gold_values else 500
+        gold_depletion_rate = (gold_start - gold_end) / gold_start if gold_start > 0 else 0.0
+        avg_income = sum(income_values) / len(income_values) if income_values else 0.0
+        avg_upkeep = sum(upkeep_values) / len(upkeep_values) if upkeep_values else 0.0
+        avg_income_upkeep_delta = avg_income - avg_upkeep
+        gold_min = min(gold_values) if gold_values else 500
+        gold_max = max(gold_values) if gold_values else 500
+
+        # ===== 5. Candidate Score 분산 =====
+        score_stds = []
+        top1_top2_gaps = []
+
+        for cd in candidates_per_turn:
+            candidates = cd["candidates"]
+            affordable = [c for c in candidates if c.get("affordable", False)]
+            if not affordable:
+                continue
+
+            scores = [c["score"] for c in affordable]
+            if len(scores) > 1:
+                import statistics as _stats
+                score_stds.append(_stats.stdev(scores))
+
+            sorted_scores = sorted(scores, reverse=True)
+            if len(sorted_scores) >= 2:
+                top1_top2_gaps.append(sorted_scores[0] - sorted_scores[1])
+
+        avg_candidate_score_std = sum(score_stds) / len(score_stds) if score_stds else 0.0
+        avg_top1_top2_gap = sum(top1_top2_gaps) / len(top1_top2_gaps) if top1_top2_gaps else 0.0
+
+        # ===== 6. Wait 선택률 =====
+        total_turns = max(events.commands.keys()) if events.commands else 0
+        wait_select_count = 0
+
+        for turn in events.commands.keys():
+            if turn in events.moves and events.moves[turn]:
+                continue
+            if turn in events.trains and events.trains[turn].warrior_ids:
+                continue
+            if turn in events.upgrades and events.upgrades[turn]:
+                continue
+            wait_select_count += 1
+
+        wait_select_rate = wait_select_count / total_turns if total_turns > 0 else 0.0
+
+        # NOTE: move_candidates_total 계산이 복잡하므로 0으로 두거나 다른 방식 사용
+        # 실제로는 candidates에서 train_n=0이고 moves가 있는 candidate 수를 세되,
+        # 중복을 제거해야 함 (여러 warrior의 move가 개별 candidate)
+        # 간단한 방식: events.moves에서 실제 MOVE 선택 횟수와
+        # candidates에서 affordable MOVE 후보 수의 비율로 근사
+        # 하지만 현재 데이터 구조상 정확히 계산하기 어려우므로 0으로 둠
+        move_candidates_total = 0  # 근사치 계산困难
+        move_selected_count = sum(len(m) for m in events.moves.values()) if events.moves else 0
+
+        return ExtendedMetrics(
+            match_id=match_id,
+            move_candidates_total=move_candidates_total,
+            move_selected_count=move_selected_count,
+            move_rejection_rate=0.0,  # NOTE: 정확히 계산하려면 candidate 생성 로직 필요
+            avg_train_top1_score=avg_train_top1_score,
+            avg_move_top1_score=avg_move_top1_score,
+            avg_train_move_score_gap=avg_train_move_score_gap,
+            upgrade_candidates_generated=upgrade_candidates_generated,
+            upgrade_selected_count=upgrade_selected_count,
+            upgrade_creation_selection_rate=upgrade_creation_selection_rate,
+            gold_start=gold_start,
+            gold_end=gold_end,
+            gold_depletion_rate=gold_depletion_rate,
+            avg_income=avg_income,
+            avg_upkeep=avg_upkeep,
+            avg_income_upkeep_delta=avg_income_upkeep_delta,
+            gold_min=gold_min,
+            gold_max=gold_max,
+            avg_candidate_score_std=avg_candidate_score_std,
+            avg_top1_top2_gap=avg_top1_top2_gap,
+            wait_select_count=wait_select_count,
+            wait_select_rate=wait_select_rate
+        )
+
+
+# =============================================================================
+# 4. Metric Extractor 모듈: 순수 수치 추출
 # =============================================================================
 
 @dataclass
@@ -1239,27 +1528,28 @@ def main():
     analysis_dir = project_root / args.analysis_dir
 
     print("=" * 60)
-    print("🎮 NYPC AI 전략 분석 플랫폼 - Baseline Benchmark 분석")
+    print("[NYPC AI Strategy Analysis Platform] Baseline Benchmark Analysis")
     print("=" * 60)
 
-    # 모든 .log 파일 찾기
+    # Find all .log files
     log_files = sorted(raw_dir.glob("*.log"))
-    print(f"발견된 로그 파일: {len(log_files)}개")
+    print(f"Found log files: {len(log_files)}")
 
     if not log_files:
-        print("로그 파일이 없습니다. 먼저 run_matches.py를 실행하세요.")
+        print("No log files found. Run run_matches.py first.")
         return
 
     exporter = Exporter(analysis_dir)
     all_features = []
     all_events = []
     all_tracked = []
+    all_extended_metrics = []  # Extended Metrics 저장
 
     for i, log_file in enumerate(log_files):
         filename = log_file.name
         match_id = i + 1  # 단순히 순서대로 ID 할당
         
-        print(f"경기 {match_id}/{len(log_files)} 분석 중... ({filename})")
+        print(f"Match {match_id}/{len(log_files)} analyzing... ({filename})")
 
         try:
             # 분석 파이프라인
@@ -1269,15 +1559,18 @@ def main():
             patterns = PatternExtractor.extract(events, tracked, metrics)
             features = FeatureExtractor.extract(metrics, patterns)
             map_analysis = MapAnalyzer.analyze(tracked.map_data, patterns)
+            # Extended Metrics 추출 (AI 행동 분석용)
+            extended = ExtendedMetricExtractor.extract(log_file, match_id, events)
 
             exporter.export_match(match_id, events, tracked, metrics, patterns, features, map_analysis)
             all_features.append(features)
             all_events.append(events)
             all_tracked.append(tracked)
+            all_extended_metrics.append(extended)
 
-            print(f"경기 {match_id} 분석 완료")
+            print(f"Match {match_id} analysis complete")
         except Exception as e:
-            print(f"경기 {match_id} 분석 오류: {e}")
+            print(f"Match {match_id} analysis error: {e}")
 
     # 요약 내보내기
     exporter.export_summary(all_features)
@@ -1344,6 +1637,86 @@ def main():
         print(f"평균 턴 수: {sum(total_turns) / len(total_turns):.1f}")
         print(f"최소 턴 수: {min(total_turns)}")
         print(f"최대 턴 수: {max(total_turns)}")
+    
+    # ===== Extended Metrics 요약 =====
+    if all_extended_metrics:
+        print()
+        print("=" * 60)
+        print("[Extended Metrics Summary] AI Behavior Analysis")
+        print("=" * 60)
+        
+        # TRAIN vs MOVE Score Gap
+        train_move_gaps = [em.avg_train_move_score_gap for em in all_extended_metrics]
+        avg_train_move_gap = sum(train_move_gaps) / len(train_move_gaps) if train_move_gaps else 0.0
+        print(f"[TRAIN vs MOVE Score Gap]")
+        print(f"  평균 Gap: {avg_train_move_gap:.4f} (양수 = TRAIN 우위)")
+        
+        # UPGRADE 조건 충족률
+        upg_rates = [em.upgrade_creation_selection_rate for em in all_extended_metrics if em.upgrade_candidates_generated > 0]
+        avg_upg_rate = sum(upg_rates) / len(upg_rates) if upg_rates else 0.0
+        print(f"[UPGRADE 조건 충족률]")
+        print(f"  평균 선택률: {avg_upg_rate:.2%}")
+        print(f"  (선택된 UPGRADE / 생성된 UPGRADE 후보)")
+        
+        # Gold 소진률
+        gold_depletions = [em.gold_depletion_rate for em in all_extended_metrics]
+        avg_gold_depletion = sum(gold_depletions) / len(gold_depletions) if gold_depletions else 0.0
+        print(f"[Gold 소진률]")
+        print(f"  평균: {avg_gold_depletion:.2%}")
+        
+        # Income vs Upkeep Delta
+        deltas = [em.avg_income_upkeep_delta for em in all_extended_metrics]
+        avg_delta = sum(deltas) / len(deltas) if deltas else 0.0
+        print(f"[Income vs Upkeep Delta]")
+        print(f"  평균: {avg_delta:.2f} (양수 = 흑자)")
+        
+        # Wait 선택률
+        wait_rates = [em.wait_select_rate for em in all_extended_metrics]
+        avg_wait_rate = sum(wait_rates) / len(wait_rates) if wait_rates else 0.0
+        print(f"[Wait 선택률]")
+        print(f"  평균: {avg_wait_rate:.2%}")
+        
+        # Candidate Score 분산
+        score_stds = [em.avg_candidate_score_std for em in all_extended_metrics]
+        avg_score_std = sum(score_stds) / len(score_stds) if score_stds else 0.0
+        print(f"[Candidate Score 분산]")
+        print(f"  평균: {avg_score_std:.4f} (결정 불확실성)")
+        
+        # Top1-Top2 Gap
+        gaps = [em.avg_top1_top2_gap for em in all_extended_metrics]
+        avg_gap = sum(gaps) / len(gaps) if gaps else 0.0
+        print(f"[Top1-Top2 Gap]")
+        print(f"  평균: {avg_gap:.4f}")
+        
+        # Extended Metrics CSV 저장
+        ext_csv_path = analysis_dir / "extended_metrics.csv"
+        with open(ext_csv_path, "w", encoding="utf-8") as f:
+            headers = [
+                "match_id",
+                "move_candidates_total", "move_selected_count", "move_rejection_rate",
+                "avg_train_top1_score", "avg_move_top1_score", "avg_train_move_score_gap",
+                "upgrade_candidates_generated", "upgrade_selected_count", "upgrade_creation_selection_rate",
+                "gold_start", "gold_end", "gold_depletion_rate",
+                "avg_income", "avg_upkeep", "avg_income_upkeep_delta",
+                "gold_min", "gold_max",
+                "avg_candidate_score_std", "avg_top1_top2_gap",
+                "wait_select_count", "wait_select_rate"
+            ]
+            f.write(",".join(headers) + "\n")
+            for em in all_extended_metrics:
+                row = [
+                    em.match_id,
+                    em.move_candidates_total, em.move_selected_count, em.move_rejection_rate,
+                    f"{em.avg_train_top1_score:.4f}", f"{em.avg_move_top1_score:.4f}", f"{em.avg_train_move_score_gap:.4f}",
+                    em.upgrade_candidates_generated, em.upgrade_selected_count, f"{em.upgrade_creation_selection_rate:.4f}",
+                    em.gold_start, em.gold_end, f"{em.gold_depletion_rate:.4f}",
+                    f"{em.avg_income:.2f}", f"{em.avg_upkeep:.2f}", f"{em.avg_income_upkeep_delta:.4f}",
+                    em.gold_min, em.gold_max,
+                    f"{em.avg_candidate_score_std:.4f}", f"{em.avg_top1_top2_gap:.4f}",
+                    em.wait_select_count, f"{em.wait_select_rate:.4f}"
+                ]
+                f.write(",".join(str(x) for x in row) + "\n")
+        print(f"\n[OK] Extended Metrics CSV 저장: {ext_csv_path}")
     
     print()
     print("=" * 60)

@@ -671,7 +671,8 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
     """Strategy: use evaluation function to pick the best candidate actions."""
     from evaluation_function import EvaluationFunction, Weights
     from action_selector import ActionSelector
-    weights = Weights()
+    # Weight Sweep 지원: 환경변수에서 가중치 주입 (없으면 기본값)
+    weights = Weights.from_env()
     eval_fn = EvaluationFunction(weights)
     selector = ActionSelector(eval_fn)
 

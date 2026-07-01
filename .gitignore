@@ -21,8 +21,7 @@ wheels/
 *.egg
 
 # 게임 로그 (크기가 크고 많으므로 git에 올리지 않음)
-logs/raw/
-logs/analysis/
+*.log
 *.csv
 *.json
  

@@ -266,6 +266,34 @@ class Weights:
     w_upgrade_remaining_gold: float = 10.0
     w_upgrade_turns_remaining: float = 0.0
 
+    @classmethod
+    def from_env(cls):
+        """환경변수에서 가중치를 주입하여 Weights 생성.
+        환경변수가 설정되지 않은 필드는 dataclass 기본값을 사용.
+        Weight Sweep 자동화 지원용.
+        """
+        import os
+        env = os.environ
+        return cls(
+            w_turns_to_enemy_hq=float(env.get("W_TURNS_TO_ENEMY_HQ", cls.w_turns_to_enemy_hq)),
+            w_adj_allies_count=float(env.get("W_ADJ_ALLIES_COUNT", cls.w_adj_allies_count)),
+            w_adj_enemies_count=float(env.get("W_ADJ_ENEMIES_COUNT", cls.w_adj_enemies_count)),
+            w_is_stronghold=float(env.get("W_IS_STRONGHOLD", cls.w_is_stronghold)),
+            w_is_on_hq=float(env.get("W_IS_ON_HQ", cls.w_is_on_hq)),
+            w_is_hq_adjacent=float(env.get("W_IS_HQ_ADJACENT", cls.w_is_hq_adjacent)),
+            w_move_cost=float(env.get("W_MOVE_COST", cls.w_move_cost)),
+            w_turns_remaining=float(env.get("W_TURNS_REMAINING", cls.w_turns_remaining)),
+            w_remaining_gold_after_action=float(env.get("W_REMAINING_GOLD_AFTER_ACTION", cls.w_remaining_gold_after_action)),
+            w_train_n=float(env.get("W_TRAIN_N", cls.w_train_n)),
+            w_train_cost=float(env.get("W_TRAIN_COST", cls.w_train_cost)),
+            w_train_remaining_gold=float(env.get("W_TRAIN_REMAINING_GOLD", cls.w_train_remaining_gold)),
+            w_train_turns_remaining=float(env.get("W_TRAIN_TURNS_REMAINING", cls.w_train_turns_remaining)),
+            w_upgrade_is_stronghold=float(env.get("W_UPGRADE_IS_STRONGHOLD", cls.w_upgrade_is_stronghold)),
+            w_upgrade_cost=float(env.get("W_UPGRADE_COST", cls.w_upgrade_cost)),
+            w_upgrade_remaining_gold=float(env.get("W_UPGRADE_REMAINING_GOLD", cls.w_upgrade_remaining_gold)),
+            w_upgrade_turns_remaining=float(env.get("W_UPGRADE_TURNS_REMAINING", cls.w_upgrade_turns_remaining)),
+        )
+
 
 class EvaluationFunction:
     def __init__(self, weights: Weights = Weights()):
@@ -1290,7 +1318,8 @@ def generate_candidates(S: GameState, M: GameMap, P: Paths, turn: int) -> list[A
 
 def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
     """Strategy: use evaluation function to pick the best candidate actions."""
-    weights = Weights()
+    # Weight Sweep 지원: 환경변수에서 가중치 주입 (없으면 기본값)
+    weights = Weights.from_env()
     eval_fn = EvaluationFunction(weights)
     selector = ActionSelector(eval_fn)
 
