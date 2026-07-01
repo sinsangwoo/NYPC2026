@@ -15,27 +15,26 @@ from feature_calculator import FeatureCalculator, MoveFeatures, TrainFeatures, U
 @dataclass
 class Weights:
     # Move weights
-    w_dist_to_enemy_hq: float = -10.0
-    w_dist_to_nearest_enemy: float = -5.0
+    w_turns_to_enemy_hq: float = -1.0  # turns_to_enemy_hq가 적을수록 좋음
     w_adj_allies_count: float = 2.0
     w_adj_enemies_count: float = -10.0
     w_is_stronghold: float = 1.0
     w_is_on_hq: float = 1000.0
     w_is_hq_adjacent: float = 500.0
-    w_move_cost: float = -0.0
+    w_move_cost: float = -10.0  # move_cost가 True이면 나쁨
     w_turns_remaining: float = 0.0
-    w_remaining_gold_after_action: float = 0.1
+    w_remaining_gold_after_action: float = 10.0
 
     # Train weights
     w_train_n: float = 50.0
-    w_train_cost: float = -0.01
-    w_train_remaining_gold: float = 0.1
+    w_train_cost: float = -10.0
+    w_train_remaining_gold: float = 10.0
     w_train_turns_remaining: float = 0.0
 
     # Upgrade weights
     w_upgrade_is_stronghold: float = 200.0
-    w_upgrade_cost: float = -0.01
-    w_upgrade_remaining_gold: float = 0.1
+    w_upgrade_cost: float = -10.0
+    w_upgrade_remaining_gold: float = 10.0
     w_upgrade_turns_remaining: float = 0.0
 
 
@@ -44,56 +43,79 @@ class EvaluationFunction:
         self.weights = weights
 
     def evaluate_move(self, features: MoveFeatures) -> float:
-        score = 0.0
-        components = []
+        # Feature Extraction (raw features)
+        f_turns_to_enemy_hq = features.turns_to_enemy_hq
+        f_adj_allies_count = features.adj_allies_count
+        f_adj_enemies_count = features.adj_enemies_count
+        f_is_stronghold = features.is_stronghold
+        f_is_on_hq = features.is_on_hq
+        f_is_hq_adjacent = features.is_hq_adjacent
+        f_move_cost = features.move_cost
+        f_turns_remaining = features.turns_remaining
+        f_remaining_gold_after_action = features.remaining_gold_after_action
 
-        components.append(("w_dist_to_enemy_hq", self.weights.w_dist_to_enemy_hq, features.dist_to_enemy_hq, self.weights.w_dist_to_enemy_hq * features.dist_to_enemy_hq))
-        score += self.weights.w_dist_to_enemy_hq * features.dist_to_enemy_hq
+        # Feature Transformation
+        # turns_to_enemy_hq: (200 - turns) / 200 → 적을수록 높은 값
+        t_turns_to_enemy_hq = (200.0 - f_turns_to_enemy_hq) / 200.0
+        t_adj_allies_count = f_adj_allies_count
+        t_adj_enemies_count = f_adj_enemies_count
+        t_is_stronghold = 1.0 if f_is_stronghold else 0.0
+        t_is_on_hq = 1.0 if f_is_on_hq else 0.0
+        t_is_hq_adjacent = 1.0 if f_is_hq_adjacent else 0.0
+        t_move_cost = 1.0 if f_move_cost else 0.0
+        t_turns_remaining = f_turns_remaining
+        t_remaining_gold_after_action = max(0.0, f_remaining_gold_after_action)  # 음수 제한
 
-        components.append(("w_dist_to_nearest_enemy", self.weights.w_dist_to_nearest_enemy, features.dist_to_nearest_enemy, self.weights.w_dist_to_nearest_enemy * features.dist_to_nearest_enemy))
-        score += self.weights.w_dist_to_nearest_enemy * features.dist_to_nearest_enemy
+        # Contribution 계산 (개별 변수)
+        contrib_turns_to_enemy_hq = self.weights.w_turns_to_enemy_hq * t_turns_to_enemy_hq
+        contrib_adj_allies_count = self.weights.w_adj_allies_count * t_adj_allies_count
+        contrib_adj_enemies_count = self.weights.w_adj_enemies_count * t_adj_enemies_count
+        contrib_is_stronghold = self.weights.w_is_stronghold * t_is_stronghold
+        contrib_is_on_hq = self.weights.w_is_on_hq * t_is_on_hq
+        contrib_is_hq_adjacent = self.weights.w_is_hq_adjacent * t_is_hq_adjacent
+        contrib_move_cost = self.weights.w_move_cost * t_move_cost
+        contrib_turns_remaining = self.weights.w_turns_remaining * t_turns_remaining
+        contrib_remaining_gold_after_action = self.weights.w_remaining_gold_after_action * t_remaining_gold_after_action
 
-        components.append(("w_adj_allies_count", self.weights.w_adj_allies_count, features.adj_allies_count, self.weights.w_adj_allies_count * features.adj_allies_count))
-        score += self.weights.w_adj_allies_count * features.adj_allies_count
+        # Score = Sum of Contributions
+        score = (
+            contrib_turns_to_enemy_hq +
+            contrib_adj_allies_count +
+            contrib_adj_enemies_count +
+            contrib_is_stronghold +
+            contrib_is_on_hq +
+            contrib_is_hq_adjacent +
+            contrib_move_cost +
+            contrib_turns_remaining +
+            contrib_remaining_gold_after_action
+        )
 
-        components.append(("w_adj_enemies_count", self.weights.w_adj_enemies_count, features.adj_enemies_count, self.weights.w_adj_enemies_count * features.adj_enemies_count))
-        score += self.weights.w_adj_enemies_count * features.adj_enemies_count
-
-        components.append(("w_is_stronghold", self.weights.w_is_stronghold, 1 if features.is_stronghold else 0, self.weights.w_is_stronghold * (1 if features.is_stronghold else 0)))
-        score += self.weights.w_is_stronghold * (1 if features.is_stronghold else 0)
-
-        components.append(("w_is_on_hq", self.weights.w_is_on_hq, 1 if features.is_on_hq else 0, self.weights.w_is_on_hq * (1 if features.is_on_hq else 0)))
-        score += self.weights.w_is_on_hq * (1 if features.is_on_hq else 0)
-
-        components.append(("w_is_hq_adjacent", self.weights.w_is_hq_adjacent, 1 if features.is_hq_adjacent else 0, self.weights.w_is_hq_adjacent * (1 if features.is_hq_adjacent else 0)))
-        score += self.weights.w_is_hq_adjacent * (1 if features.is_hq_adjacent else 0)
-
-        components.append(("w_move_cost", self.weights.w_move_cost, features.move_cost, self.weights.w_move_cost * features.move_cost))
-        score += self.weights.w_move_cost * features.move_cost
-
-        components.append(("w_turns_remaining", self.weights.w_turns_remaining, features.turns_remaining, self.weights.w_turns_remaining * features.turns_remaining))
-        score += self.weights.w_turns_remaining * features.turns_remaining
-
-        components.append(("w_remaining_gold_after_action", self.weights.w_remaining_gold_after_action, features.remaining_gold_after_action, self.weights.w_remaining_gold_after_action * features.remaining_gold_after_action))
-        score += self.weights.w_remaining_gold_after_action * features.remaining_gold_after_action
-
-        # Debug: Print move evaluation
+        # Debug: Print move evaluation (Feature Dump, Contribution Dump, Final Score Dump)
         debug_data = {
             "type": "move",
-            "features": {
-                "dist_to_enemy_hq": features.dist_to_enemy_hq,
-                "dist_to_nearest_enemy": features.dist_to_nearest_enemy,
-                "adj_allies_count": features.adj_allies_count,
-                "adj_enemies_count": features.adj_enemies_count,
-                "is_stronghold": features.is_stronghold,
-                "is_on_hq": features.is_on_hq,
-                "is_hq_adjacent": features.is_hq_adjacent,
-                "move_cost": features.move_cost,
-                "turns_remaining": features.turns_remaining,
-                "remaining_gold_after_action": features.remaining_gold_after_action
+            "feature_dump": {
+                "turns_to_enemy_hq": f_turns_to_enemy_hq,
+                "adj_allies_count": f_adj_allies_count,
+                "adj_enemies_count": f_adj_enemies_count,
+                "is_stronghold": f_is_stronghold,
+                "is_on_hq": f_is_on_hq,
+                "is_hq_adjacent": f_is_hq_adjacent,
+                "move_cost": f_move_cost,
+                "turns_remaining": f_turns_remaining,
+                "remaining_gold_after_action": f_remaining_gold_after_action
             },
-            "components": components,
-            "total_score": score
+            "contribution_dump": {
+                "contrib_turns_to_enemy_hq": contrib_turns_to_enemy_hq,
+                "contrib_adj_allies_count": contrib_adj_allies_count,
+                "contrib_adj_enemies_count": contrib_adj_enemies_count,
+                "contrib_is_stronghold": contrib_is_stronghold,
+                "contrib_is_on_hq": contrib_is_on_hq,
+                "contrib_is_hq_adjacent": contrib_is_hq_adjacent,
+                "contrib_move_cost": contrib_move_cost,
+                "contrib_turns_remaining": contrib_turns_remaining,
+                "contrib_remaining_gold_after_action": contrib_remaining_gold_after_action
+            },
+            "final_score": score
         }
         print(json.dumps(debug_data), file=sys.stderr)
         sys.stderr.flush()
@@ -101,32 +123,48 @@ class EvaluationFunction:
         return score
 
     def evaluate_train(self, features: TrainFeatures) -> float:
-        score = 0.0
-        components = []
+        # Feature Extraction (raw features)
+        f_train_n = features.train_n
+        f_train_cost = features.train_cost
+        f_turns_remaining = features.turns_remaining
+        f_remaining_gold_after_action = features.remaining_gold_after_action
 
-        components.append(("w_train_n", self.weights.w_train_n, features.train_n, self.weights.w_train_n * features.train_n))
-        score += self.weights.w_train_n * features.train_n
+        # Feature Transformation
+        t_train_n = f_train_n
+        t_train_cost = f_train_cost
+        t_turns_remaining = f_turns_remaining
+        t_remaining_gold_after_action = max(0.0, f_remaining_gold_after_action)  # 음수 제한
 
-        components.append(("w_train_cost", self.weights.w_train_cost, features.train_cost, self.weights.w_train_cost * features.train_cost))
-        score += self.weights.w_train_cost * features.train_cost
+        # Contribution 계산 (개별 변수)
+        contrib_train_n = self.weights.w_train_n * t_train_n
+        contrib_train_cost = self.weights.w_train_cost * t_train_cost
+        contrib_train_turns_remaining = self.weights.w_train_turns_remaining * t_turns_remaining
+        contrib_train_remaining_gold = self.weights.w_train_remaining_gold * t_remaining_gold_after_action
 
-        components.append(("w_train_remaining_gold", self.weights.w_train_remaining_gold, features.remaining_gold_after_action, self.weights.w_train_remaining_gold * features.remaining_gold_after_action))
-        score += self.weights.w_train_remaining_gold * features.remaining_gold_after_action
+        # Score = Sum of Contributions
+        score = (
+            contrib_train_n +
+            contrib_train_cost +
+            contrib_train_turns_remaining +
+            contrib_train_remaining_gold
+        )
 
-        components.append(("w_train_turns_remaining", self.weights.w_train_turns_remaining, features.turns_remaining, self.weights.w_train_turns_remaining * features.turns_remaining))
-        score += self.weights.w_train_turns_remaining * features.turns_remaining
-
-        # Debug: Print train evaluation
+        # Debug: Print train evaluation (Feature Dump, Contribution Dump, Final Score Dump)
         debug_data = {
             "type": "train",
-            "features": {
-                "train_n": features.train_n,
-                "train_cost": features.train_cost,
-                "remaining_gold_after_action": features.remaining_gold_after_action,
-                "turns_remaining": features.turns_remaining
+            "feature_dump": {
+                "train_n": f_train_n,
+                "train_cost": f_train_cost,
+                "turns_remaining": f_turns_remaining,
+                "remaining_gold_after_action": f_remaining_gold_after_action
             },
-            "components": components,
-            "total_score": score
+            "contribution_dump": {
+                "contrib_train_n": contrib_train_n,
+                "contrib_train_cost": contrib_train_cost,
+                "contrib_train_turns_remaining": contrib_train_turns_remaining,
+                "contrib_train_remaining_gold": contrib_train_remaining_gold
+            },
+            "final_score": score
         }
         print(json.dumps(debug_data), file=sys.stderr)
         sys.stderr.flush()
@@ -134,32 +172,48 @@ class EvaluationFunction:
         return score
 
     def evaluate_upgrade(self, features: UpgradeFeatures) -> float:
-        score = 0.0
-        components = []
+        # Feature Extraction (raw features)
+        f_upgrade_cost = features.upgrade_cost
+        f_is_stronghold = features.is_stronghold
+        f_turns_remaining = features.turns_remaining
+        f_remaining_gold_after_action = features.remaining_gold_after_action
 
-        components.append(("w_upgrade_is_stronghold", self.weights.w_upgrade_is_stronghold, 1 if features.is_stronghold else 0, self.weights.w_upgrade_is_stronghold * (1 if features.is_stronghold else 0)))
-        score += self.weights.w_upgrade_is_stronghold * (1 if features.is_stronghold else 0)
+        # Feature Transformation
+        t_is_stronghold = 1.0 if f_is_stronghold else 0.0
+        t_upgrade_cost = f_upgrade_cost
+        t_turns_remaining = f_turns_remaining
+        t_remaining_gold_after_action = max(0.0, f_remaining_gold_after_action)  # 음수 제한
 
-        components.append(("w_upgrade_cost", self.weights.w_upgrade_cost, features.upgrade_cost, self.weights.w_upgrade_cost * features.upgrade_cost))
-        score += self.weights.w_upgrade_cost * features.upgrade_cost
+        # Contribution 계산 (개별 변수)
+        contrib_upgrade_is_stronghold = self.weights.w_upgrade_is_stronghold * t_is_stronghold
+        contrib_upgrade_cost = self.weights.w_upgrade_cost * t_upgrade_cost
+        contrib_upgrade_turns_remaining = self.weights.w_upgrade_turns_remaining * t_turns_remaining
+        contrib_upgrade_remaining_gold = self.weights.w_upgrade_remaining_gold * t_remaining_gold_after_action
 
-        components.append(("w_upgrade_remaining_gold", self.weights.w_upgrade_remaining_gold, features.remaining_gold_after_action, self.weights.w_upgrade_remaining_gold * features.remaining_gold_after_action))
-        score += self.weights.w_upgrade_remaining_gold * features.remaining_gold_after_action
+        # Score = Sum of Contributions
+        score = (
+            contrib_upgrade_is_stronghold +
+            contrib_upgrade_cost +
+            contrib_upgrade_turns_remaining +
+            contrib_upgrade_remaining_gold
+        )
 
-        components.append(("w_upgrade_turns_remaining", self.weights.w_upgrade_turns_remaining, features.turns_remaining, self.weights.w_upgrade_turns_remaining * features.turns_remaining))
-        score += self.weights.w_upgrade_turns_remaining * features.turns_remaining
-
-        # Debug: Print upgrade evaluation
+        # Debug: Print upgrade evaluation (Feature Dump, Contribution Dump, Final Score Dump)
         debug_data = {
             "type": "upgrade",
-            "features": {
-                "is_stronghold": features.is_stronghold,
-                "upgrade_cost": features.upgrade_cost,
-                "remaining_gold_after_action": features.remaining_gold_after_action,
-                "turns_remaining": features.turns_remaining
+            "feature_dump": {
+                "is_stronghold": f_is_stronghold,
+                "upgrade_cost": f_upgrade_cost,
+                "turns_remaining": f_turns_remaining,
+                "remaining_gold_after_action": f_remaining_gold_after_action
             },
-            "components": components,
-            "total_score": score
+            "contribution_dump": {
+                "contrib_upgrade_is_stronghold": contrib_upgrade_is_stronghold,
+                "contrib_upgrade_cost": contrib_upgrade_cost,
+                "contrib_upgrade_turns_remaining": contrib_upgrade_turns_remaining,
+                "contrib_upgrade_remaining_gold": contrib_upgrade_remaining_gold
+            },
+            "final_score": score
         }
         print(json.dumps(debug_data), file=sys.stderr)
         sys.stderr.flush()

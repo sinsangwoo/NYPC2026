@@ -16,6 +16,14 @@ class ActionSelector:
     def __init__(self, eval_fn: EvaluationFunction):
         self.eval_fn = eval_fn
 
+    def _get_phase_weights(self, turn: int):
+        """
+        Turn Phase에 따른 Weight 변경 Hook
+        현재는 구현하지 않고 기본 Weight 반환
+        """
+        # TODO: Weight Schedule 구현 시 여기에 로직 추가
+        return self.eval_fn.weights
+
     def select_best_actions(
         self, S: GameState, M: GameMap, P: Paths, turn: int
     ) -> Actions:
@@ -23,10 +31,22 @@ class ActionSelector:
         best_score = -math.inf
         best_actions = candidates[0]
 
+        # Debug: Feature Distribution과 Final Score Distribution 수집
+        feature_distribution = {
+            "turns_to_enemy_hq": [],
+            "adj_allies_count": [],
+            "adj_enemies_count": [],
+            "train_n": [],
+            "is_stronghold": []
+        }
+        final_score_distribution = []
+
         # Debug: Print all candidates
         debug_data = {
             "turn": turn,
-            "candidates": []
+            "candidates": [],
+            "feature_distribution": feature_distribution,
+            "final_score_distribution": final_score_distribution
         }
 
         for idx, candidate in enumerate(candidates):
@@ -36,7 +56,15 @@ class ActionSelector:
             
             score = 0.0
             if affordable:
+                # Phase에 맞는 Weight 적용 (Hook)
+                original_weights = self.eval_fn.weights
+                self.eval_fn.weights = self._get_phase_weights(turn)
+                
                 score = self.eval_fn.evaluate_actions(S, M, P, candidate, turn)
+                
+                # Weight 복원
+                self.eval_fn.weights = original_weights
+                
                 # Prefer doing something to doing nothing
                 if candidate.train_n > 0 or candidate.moves or candidate.upgrades:
                     score += 0.1
@@ -52,6 +80,12 @@ class ActionSelector:
                 "score": score
             }
             debug_data["candidates"].append(candidate_data)
+            
+            # Final Score Distribution 수집
+            final_score_distribution.append({
+                "idx": idx,
+                "score": score
+            })
 
             if affordable and score > best_score:
                 best_score = score

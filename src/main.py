@@ -356,6 +356,7 @@ def read_turn_result(S: GameState, M: GameMap, submitted: Actions) -> None:
 class Paths:
     dist: list[list[float]]
     nxt: list[list[int]]
+    hop_dist: list[list[int]]
 
 
 def euclid_ceil(M: GameMap, u: int, v: int) -> float:
@@ -365,30 +366,38 @@ def euclid_ceil(M: GameMap, u: int, v: int) -> float:
 def calculate_paths(M: GameMap) -> Paths:
     INF = math.inf
     N = M.N
+    HOP_INF = N  # hop 수의 최대값은 N-1을 넘지 않으므로 N으로 설정
     dist = [[INF] * N for _ in range(N)]
     nxt = [[-1] * N for _ in range(N)]
+    hop_dist = [[HOP_INF] * N for _ in range(N)]
 
     for i in range(N):
         dist[i][i] = 0.0
         nxt[i][i] = i
+        hop_dist[i][i] = 0
     for u in range(N):
         for v in M.adj[u]:
             w = euclid_ceil(M, u, v)
             if w < dist[u][v]:
                 dist[u][v] = w
+                hop_dist[u][v] = 1  # 인접 노드는 hop 수 1
 
     # Floyd-Warshall
     for k in range(N):
         dk = dist[k]
+        hk = hop_dist[k]
         for u in range(N):
             du = dist[u]
+            hu = hop_dist[u]
             duk = du[k]
+            huk = hu[k]
             if duk == INF:
                 continue
             for v in range(N):
-                cand = duk + dk[v]
-                if cand < du[v]:
-                    du[v] = cand
+                cand_dist = duk + dk[v]
+                if cand_dist < du[v]:
+                    du[v] = cand_dist
+                    hu[v] = huk + hk[v]
 
     for u in range(N):
         du = dist[u]
@@ -403,7 +412,7 @@ def calculate_paths(M: GameMap) -> Paths:
                 if score < best_score:
                     best_score = score
                     nxt[u][v] = nb
-    return Paths(dist, nxt)
+    return Paths(dist, nxt, hop_dist)
 
 
 def next_step(P: Paths, u: int, v: int) -> int:

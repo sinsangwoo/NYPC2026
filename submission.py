@@ -9,11 +9,21 @@ Action Selector Module for NYPC 2026 AI
 Selects the best candidate actions based on scores
 """
 import math
+import sys
+import json
 
 
 class ActionSelector:
     def __init__(self, eval_fn: EvaluationFunction):
         self.eval_fn = eval_fn
+
+    def _get_phase_weights(self, turn: int):
+        """
+        Turn Phase에 따른 Weight 변경 Hook
+        현재는 구현하지 않고 기본 Weight 반환
+        """
+        # TODO: Weight Schedule 구현 시 여기에 로직 추가
+        return self.eval_fn.weights
 
     def select_best_actions(
         self, S: GameState, M: GameMap, P: Paths, turn: int
@@ -22,20 +32,71 @@ class ActionSelector:
         best_score = -math.inf
         best_actions = candidates[0]
 
-        for candidate in candidates:
+        # Debug: Feature Distribution과 Final Score Distribution 수집
+        feature_distribution = {
+            "turns_to_enemy_hq": [],
+            "adj_allies_count": [],
+            "adj_enemies_count": [],
+            "train_n": [],
+            "is_stronghold": []
+        }
+        final_score_distribution = []
+
+        # Debug: Print all candidates
+        debug_data = {
+            "turn": turn,
+            "candidates": [],
+            "feature_distribution": feature_distribution,
+            "final_score_distribution": final_score_distribution
+        }
+
+        for idx, candidate in enumerate(candidates):
             # Check if candidate is affordable
             total_cost = self._calculate_candidate_cost(S, M, P, candidate)
-            if S.gold < total_cost:
-                continue
+            affordable = S.gold >= total_cost
+            
+            score = 0.0
+            if affordable:
+                # Phase에 맞는 Weight 적용 (Hook)
+                original_weights = self.eval_fn.weights
+                self.eval_fn.weights = self._get_phase_weights(turn)
+                
+                score = self.eval_fn.evaluate_actions(S, M, P, candidate, turn)
+                
+                # Weight 복원
+                self.eval_fn.weights = original_weights
+                
+                # Prefer doing something to doing nothing
+                if candidate.train_n > 0 or candidate.moves or candidate.upgrades:
+                    score += 0.1
 
-            score = self.eval_fn.evaluate_actions(S, M, P, candidate, turn)
-            # Prefer doing something to doing nothing
-            if candidate.train_n > 0 or candidate.moves or candidate.upgrades:
-                score += 0.1
+            # Collect candidate data
+            candidate_data = {
+                "idx": idx,
+                "train_n": candidate.train_n,
+                "moves": [f"{wid}->{target}" for wid, target in candidate.moves],
+                "upgrades": candidate.upgrades,
+                "cost": total_cost,
+                "affordable": affordable,
+                "score": score
+            }
+            debug_data["candidates"].append(candidate_data)
+            
+            # Final Score Distribution 수집
+            final_score_distribution.append({
+                "idx": idx,
+                "score": score
+            })
 
-            if score > best_score:
+            if affordable and score > best_score:
                 best_score = score
                 best_actions = candidate
+
+        # Debug: Print best action
+        debug_data["best_idx"] = candidates.index(best_actions)
+        debug_data["best_score"] = best_score
+        print(json.dumps(debug_data), file=sys.stderr)
+        sys.stderr.flush()
 
         return best_actions
 
@@ -175,100 +236,216 @@ Evaluation Function Module for NYPC 2026 AI
 Calculates scores for candidate actions using features
 """
 import math
+import sys
+import json
 from dataclasses import dataclass
 
 
 @dataclass
 class Weights:
     # Move weights
-    w_dist_to_enemy_hq: float = -10.0
-    w_dist_to_nearest_enemy: float = -5.0
+    w_turns_to_enemy_hq: float = -1.0  # turns_to_enemy_hq가 적을수록 좋음
     w_adj_allies_count: float = 2.0
     w_adj_enemies_count: float = -10.0
     w_is_stronghold: float = 1.0
     w_is_on_hq: float = 1000.0
     w_is_hq_adjacent: float = 500.0
-    w_move_cost: float = -0.0
+    w_move_cost: float = -10.0  # move_cost가 True이면 나쁨
     w_turns_remaining: float = 0.0
-    w_remaining_gold_after_action: float = 0.1
+    w_remaining_gold_after_action: float = 10.0
 
     # Train weights
     w_train_n: float = 50.0
-    w_train_cost: float = -0.01
-    w_train_remaining_gold: float = 0.1
+    w_train_cost: float = -10.0
+    w_train_remaining_gold: float = 10.0
     w_train_turns_remaining: float = 0.0
 
     # Upgrade weights
     w_upgrade_is_stronghold: float = 200.0
-    w_upgrade_cost: float = -0.01
-    w_upgrade_remaining_gold: float = 0.1
+    w_upgrade_cost: float = -10.0
+    w_upgrade_remaining_gold: float = 10.0
     w_upgrade_turns_remaining: float = 0.0
 
-
-import sys
-
-def debug_print(msg):
-    """Print debug message to stderr to avoid interfering with stdout commands"""
-    print(msg, file=sys.stderr)
 
 class EvaluationFunction:
     def __init__(self, weights: Weights = Weights()):
         self.weights = weights
 
     def evaluate_move(self, features: MoveFeatures) -> float:
-        score = 0.0
-        debug_print(f"[FORENSICS-EVAL] [MOVE] Calculation:")
-        debug_print(f"[FORENSICS-EVAL]   - w_dist_to_enemy_hq ({self.weights.w_dist_to_enemy_hq}) × dist_to_enemy_hq ({features.dist_to_enemy_hq}) = {self.weights.w_dist_to_enemy_hq * features.dist_to_enemy_hq}")
-        score += self.weights.w_dist_to_enemy_hq * features.dist_to_enemy_hq
-        debug_print(f"[FORENSICS-EVAL]   - w_dist_to_nearest_enemy ({self.weights.w_dist_to_nearest_enemy}) × dist_to_nearest_enemy ({features.dist_to_nearest_enemy}) = {self.weights.w_dist_to_nearest_enemy * features.dist_to_nearest_enemy}")
-        score += self.weights.w_dist_to_nearest_enemy * features.dist_to_nearest_enemy
-        debug_print(f"[FORENSICS-EVAL]   - w_adj_allies_count ({self.weights.w_adj_allies_count}) × adj_allies_count ({features.adj_allies_count}) = {self.weights.w_adj_allies_count * features.adj_allies_count}")
-        score += self.weights.w_adj_allies_count * features.adj_allies_count
-        debug_print(f"[FORENSICS-EVAL]   - w_adj_enemies_count ({self.weights.w_adj_enemies_count}) × adj_enemies_count ({features.adj_enemies_count}) = {self.weights.w_adj_enemies_count * features.adj_enemies_count}")
-        score += self.weights.w_adj_enemies_count * features.adj_enemies_count
-        debug_print(f"[FORENSICS-EVAL]   - w_is_stronghold ({self.weights.w_is_stronghold}) × is_stronghold ({1 if features.is_stronghold else 0}) = {self.weights.w_is_stronghold * (1 if features.is_stronghold else 0)}")
-        score += self.weights.w_is_stronghold * (1 if features.is_stronghold else 0)
-        debug_print(f"[FORENSICS-EVAL]   - w_is_on_hq ({self.weights.w_is_on_hq}) × is_on_hq ({1 if features.is_on_hq else 0}) = {self.weights.w_is_on_hq * (1 if features.is_on_hq else 0)}")
-        score += self.weights.w_is_on_hq * (1 if features.is_on_hq else 0)
-        debug_print(f"[FORENSICS-EVAL]   - w_is_hq_adjacent ({self.weights.w_is_hq_adjacent}) × is_hq_adjacent ({1 if features.is_hq_adjacent else 0}) = {self.weights.w_is_hq_adjacent * (1 if features.is_hq_adjacent else 0)}")
-        score += self.weights.w_is_hq_adjacent * (1 if features.is_hq_adjacent else 0)
-        debug_print(f"[FORENSICS-EVAL]   - w_move_cost ({self.weights.w_move_cost}) × move_cost ({features.move_cost}) = {self.weights.w_move_cost * features.move_cost}")
-        score += self.weights.w_move_cost * features.move_cost
-        debug_print(f"[FORENSICS-EVAL]   - w_turns_remaining ({self.weights.w_turns_remaining}) × turns_remaining ({features.turns_remaining}) = {self.weights.w_turns_remaining * features.turns_remaining}")
-        score += self.weights.w_turns_remaining * features.turns_remaining
-        debug_print(f"[FORENSICS-EVAL]   - w_remaining_gold_after_action ({self.weights.w_remaining_gold_after_action}) × remaining_gold_after_action ({features.remaining_gold_after_action}) = {self.weights.w_remaining_gold_after_action * features.remaining_gold_after_action}")
-        score += self.weights.w_remaining_gold_after_action * features.remaining_gold_after_action
-        debug_print(f"[FORENSICS-EVAL] [MOVE] Total Score: {score}")
+        # Feature Extraction (raw features)
+        f_turns_to_enemy_hq = features.turns_to_enemy_hq
+        f_adj_allies_count = features.adj_allies_count
+        f_adj_enemies_count = features.adj_enemies_count
+        f_is_stronghold = features.is_stronghold
+        f_is_on_hq = features.is_on_hq
+        f_is_hq_adjacent = features.is_hq_adjacent
+        f_move_cost = features.move_cost
+        f_turns_remaining = features.turns_remaining
+        f_remaining_gold_after_action = features.remaining_gold_after_action
+
+        # Feature Transformation
+        # turns_to_enemy_hq: (200 - turns) / 200 → 적을수록 높은 값
+        t_turns_to_enemy_hq = (200.0 - f_turns_to_enemy_hq) / 200.0
+        t_adj_allies_count = f_adj_allies_count
+        t_adj_enemies_count = f_adj_enemies_count
+        t_is_stronghold = 1.0 if f_is_stronghold else 0.0
+        t_is_on_hq = 1.0 if f_is_on_hq else 0.0
+        t_is_hq_adjacent = 1.0 if f_is_hq_adjacent else 0.0
+        t_move_cost = 1.0 if f_move_cost else 0.0
+        t_turns_remaining = f_turns_remaining
+        t_remaining_gold_after_action = max(0.0, f_remaining_gold_after_action)  # 음수 제한
+
+        # Contribution 계산 (개별 변수)
+        contrib_turns_to_enemy_hq = self.weights.w_turns_to_enemy_hq * t_turns_to_enemy_hq
+        contrib_adj_allies_count = self.weights.w_adj_allies_count * t_adj_allies_count
+        contrib_adj_enemies_count = self.weights.w_adj_enemies_count * t_adj_enemies_count
+        contrib_is_stronghold = self.weights.w_is_stronghold * t_is_stronghold
+        contrib_is_on_hq = self.weights.w_is_on_hq * t_is_on_hq
+        contrib_is_hq_adjacent = self.weights.w_is_hq_adjacent * t_is_hq_adjacent
+        contrib_move_cost = self.weights.w_move_cost * t_move_cost
+        contrib_turns_remaining = self.weights.w_turns_remaining * t_turns_remaining
+        contrib_remaining_gold_after_action = self.weights.w_remaining_gold_after_action * t_remaining_gold_after_action
+
+        # Score = Sum of Contributions
+        score = (
+            contrib_turns_to_enemy_hq +
+            contrib_adj_allies_count +
+            contrib_adj_enemies_count +
+            contrib_is_stronghold +
+            contrib_is_on_hq +
+            contrib_is_hq_adjacent +
+            contrib_move_cost +
+            contrib_turns_remaining +
+            contrib_remaining_gold_after_action
+        )
+
+        # Debug: Print move evaluation (Feature Dump, Contribution Dump, Final Score Dump)
+        debug_data = {
+            "type": "move",
+            "feature_dump": {
+                "turns_to_enemy_hq": f_turns_to_enemy_hq,
+                "adj_allies_count": f_adj_allies_count,
+                "adj_enemies_count": f_adj_enemies_count,
+                "is_stronghold": f_is_stronghold,
+                "is_on_hq": f_is_on_hq,
+                "is_hq_adjacent": f_is_hq_adjacent,
+                "move_cost": f_move_cost,
+                "turns_remaining": f_turns_remaining,
+                "remaining_gold_after_action": f_remaining_gold_after_action
+            },
+            "contribution_dump": {
+                "contrib_turns_to_enemy_hq": contrib_turns_to_enemy_hq,
+                "contrib_adj_allies_count": contrib_adj_allies_count,
+                "contrib_adj_enemies_count": contrib_adj_enemies_count,
+                "contrib_is_stronghold": contrib_is_stronghold,
+                "contrib_is_on_hq": contrib_is_on_hq,
+                "contrib_is_hq_adjacent": contrib_is_hq_adjacent,
+                "contrib_move_cost": contrib_move_cost,
+                "contrib_turns_remaining": contrib_turns_remaining,
+                "contrib_remaining_gold_after_action": contrib_remaining_gold_after_action
+            },
+            "final_score": score
+        }
+        print(json.dumps(debug_data), file=sys.stderr)
+        sys.stderr.flush()
 
         return score
 
     def evaluate_train(self, features: TrainFeatures) -> float:
-        score = 0.0
-        debug_print(f"[FORENSICS-EVAL] [TRAIN] Calculation:")
-        debug_print(f"[FORENSICS-EVAL]   - w_train_n ({self.weights.w_train_n}) × train_n ({features.train_n}) = {self.weights.w_train_n * features.train_n}")
-        score += self.weights.w_train_n * features.train_n
-        debug_print(f"[FORENSICS-EVAL]   - w_train_cost ({self.weights.w_train_cost}) × train_cost ({features.train_cost}) = {self.weights.w_train_cost * features.train_cost}")
-        score += self.weights.w_train_cost * features.train_cost
-        debug_print(f"[FORENSICS-EVAL]   - w_train_remaining_gold ({self.weights.w_train_remaining_gold}) × remaining_gold_after_action ({features.remaining_gold_after_action}) = {self.weights.w_train_remaining_gold * features.remaining_gold_after_action}")
-        score += self.weights.w_train_remaining_gold * features.remaining_gold_after_action
-        debug_print(f"[FORENSICS-EVAL]   - w_train_turns_remaining ({self.weights.w_train_turns_remaining}) × turns_remaining ({features.turns_remaining}) = {self.weights.w_train_turns_remaining * features.turns_remaining}")
-        score += self.weights.w_train_turns_remaining * features.turns_remaining
-        debug_print(f"[FORENSICS-EVAL] [TRAIN] Total Score: {score}")
+        # Feature Extraction (raw features)
+        f_train_n = features.train_n
+        f_train_cost = features.train_cost
+        f_turns_remaining = features.turns_remaining
+        f_remaining_gold_after_action = features.remaining_gold_after_action
+
+        # Feature Transformation
+        t_train_n = f_train_n
+        t_train_cost = f_train_cost
+        t_turns_remaining = f_turns_remaining
+        t_remaining_gold_after_action = max(0.0, f_remaining_gold_after_action)  # 음수 제한
+
+        # Contribution 계산 (개별 변수)
+        contrib_train_n = self.weights.w_train_n * t_train_n
+        contrib_train_cost = self.weights.w_train_cost * t_train_cost
+        contrib_train_turns_remaining = self.weights.w_train_turns_remaining * t_turns_remaining
+        contrib_train_remaining_gold = self.weights.w_train_remaining_gold * t_remaining_gold_after_action
+
+        # Score = Sum of Contributions
+        score = (
+            contrib_train_n +
+            contrib_train_cost +
+            contrib_train_turns_remaining +
+            contrib_train_remaining_gold
+        )
+
+        # Debug: Print train evaluation (Feature Dump, Contribution Dump, Final Score Dump)
+        debug_data = {
+            "type": "train",
+            "feature_dump": {
+                "train_n": f_train_n,
+                "train_cost": f_train_cost,
+                "turns_remaining": f_turns_remaining,
+                "remaining_gold_after_action": f_remaining_gold_after_action
+            },
+            "contribution_dump": {
+                "contrib_train_n": contrib_train_n,
+                "contrib_train_cost": contrib_train_cost,
+                "contrib_train_turns_remaining": contrib_train_turns_remaining,
+                "contrib_train_remaining_gold": contrib_train_remaining_gold
+            },
+            "final_score": score
+        }
+        print(json.dumps(debug_data), file=sys.stderr)
+        sys.stderr.flush()
 
         return score
 
     def evaluate_upgrade(self, features: UpgradeFeatures) -> float:
-        score = 0.0
-        debug_print(f"[FORENSICS-EVAL] [UPGRADE] Calculation:")
-        debug_print(f"[FORENSICS-EVAL]   - w_upgrade_is_stronghold ({self.weights.w_upgrade_is_stronghold}) × is_stronghold ({1 if features.is_stronghold else 0}) = {self.weights.w_upgrade_is_stronghold * (1 if features.is_stronghold else 0)}")
-        score += self.weights.w_upgrade_is_stronghold * (1 if features.is_stronghold else 0)
-        debug_print(f"[FORENSICS-EVAL]   - w_upgrade_cost ({self.weights.w_upgrade_cost}) × upgrade_cost ({features.upgrade_cost}) = {self.weights.w_upgrade_cost * features.upgrade_cost}")
-        score += self.weights.w_upgrade_cost * features.upgrade_cost
-        debug_print(f"[FORENSICS-EVAL]   - w_upgrade_remaining_gold ({self.weights.w_upgrade_remaining_gold}) × remaining_gold_after_action ({features.remaining_gold_after_action}) = {self.weights.w_upgrade_remaining_gold * features.remaining_gold_after_action}")
-        score += self.weights.w_upgrade_remaining_gold * features.remaining_gold_after_action
-        debug_print(f"[FORENSICS-EVAL]   - w_upgrade_turns_remaining ({self.weights.w_upgrade_turns_remaining}) × turns_remaining ({features.turns_remaining}) = {self.weights.w_upgrade_turns_remaining * features.turns_remaining}")
-        score += self.weights.w_upgrade_turns_remaining * features.turns_remaining
-        debug_print(f"[FORENSICS-EVAL] [UPGRADE] Total Score: {score}")
+        # Feature Extraction (raw features)
+        f_upgrade_cost = features.upgrade_cost
+        f_is_stronghold = features.is_stronghold
+        f_turns_remaining = features.turns_remaining
+        f_remaining_gold_after_action = features.remaining_gold_after_action
+
+        # Feature Transformation
+        t_is_stronghold = 1.0 if f_is_stronghold else 0.0
+        t_upgrade_cost = f_upgrade_cost
+        t_turns_remaining = f_turns_remaining
+        t_remaining_gold_after_action = max(0.0, f_remaining_gold_after_action)  # 음수 제한
+
+        # Contribution 계산 (개별 변수)
+        contrib_upgrade_is_stronghold = self.weights.w_upgrade_is_stronghold * t_is_stronghold
+        contrib_upgrade_cost = self.weights.w_upgrade_cost * t_upgrade_cost
+        contrib_upgrade_turns_remaining = self.weights.w_upgrade_turns_remaining * t_turns_remaining
+        contrib_upgrade_remaining_gold = self.weights.w_upgrade_remaining_gold * t_remaining_gold_after_action
+
+        # Score = Sum of Contributions
+        score = (
+            contrib_upgrade_is_stronghold +
+            contrib_upgrade_cost +
+            contrib_upgrade_turns_remaining +
+            contrib_upgrade_remaining_gold
+        )
+
+        # Debug: Print upgrade evaluation (Feature Dump, Contribution Dump, Final Score Dump)
+        debug_data = {
+            "type": "upgrade",
+            "feature_dump": {
+                "is_stronghold": f_is_stronghold,
+                "upgrade_cost": f_upgrade_cost,
+                "turns_remaining": f_turns_remaining,
+                "remaining_gold_after_action": f_remaining_gold_after_action
+            },
+            "contribution_dump": {
+                "contrib_upgrade_is_stronghold": contrib_upgrade_is_stronghold,
+                "contrib_upgrade_cost": contrib_upgrade_cost,
+                "contrib_upgrade_turns_remaining": contrib_upgrade_turns_remaining,
+                "contrib_upgrade_remaining_gold": contrib_upgrade_remaining_gold
+            },
+            "final_score": score
+        }
+        print(json.dumps(debug_data), file=sys.stderr)
+        sys.stderr.flush()
 
         return score
 
@@ -276,7 +453,6 @@ class EvaluationFunction:
         self, S: GameState, M: GameMap, P: Paths, actions: Actions, turn: int
     ) -> float:
         total_score = 0.0
-        debug_print(f"[FORENSICS-EVAL] === Evaluating Actions ===")
 
         # Evaluate all moves in this action set
         for wid, target in actions.moves:
@@ -295,7 +471,6 @@ class EvaluationFunction:
             features = FeatureCalculator.calculate_upgrade_features(S, M, P, region, turn)
             total_score += self.evaluate_upgrade(features)
 
-        debug_print(f"[FORENSICS-EVAL] === Total Actions Score: {total_score} ===")
         return total_score
 # --- END evaluation_function.py ---
 
@@ -312,33 +487,32 @@ from typing import NamedTuple
 
 @dataclass
 class MoveFeatures:
-    dist_to_enemy_hq: float
-    dist_to_nearest_enemy: float
+    turns_to_enemy_hq: int
     adj_allies_count: int
     adj_enemies_count: int
     is_stronghold: bool
     is_hq_adjacent: bool
     is_on_hq: bool
-    move_cost: int
-    turns_remaining: int
-    remaining_gold_after_action: int
+    move_cost: bool  # Binary: True if cost > 0
+    turns_remaining: float  # Ratio: (200 - turn) / 200
+    remaining_gold_after_action: float  # Ratio: remaining / START_GOLD
 
 
 @dataclass
 class TrainFeatures:
     train_n: int
-    train_cost: int
-    turns_remaining: int
-    remaining_gold_after_action: int
+    train_cost: float  # Ratio: cost / START_GOLD
+    turns_remaining: float  # Ratio: (200 - turn) / 200
+    remaining_gold_after_action: float  # Ratio: remaining / START_GOLD
 
 
 @dataclass
 class UpgradeFeatures:
     region: int
-    upgrade_cost: int
+    upgrade_cost: float  # Ratio: cost / START_GOLD
     is_stronghold: bool
-    turns_remaining: int
-    remaining_gold_after_action: int
+    turns_remaining: float  # Ratio: (200 - turn) / 200
+    remaining_gold_after_action: float  # Ratio: remaining / START_GOLD
 
 
 class FeatureCalculator:
@@ -348,20 +522,11 @@ class FeatureCalculator:
         warrior: Warrior, target_region: int, turn: int
     ) -> MoveFeatures:
         """Calculate features for a MOVE action."""
-        # Distance to enemy HQ
-        dist_to_enemy_hq = P.dist[target_region][M.opp_hq]
-        if math.isinf(dist_to_enemy_hq):
-            dist_to_enemy_hq = 1000.0
 
-        # Distance to nearest enemy
-        dist_to_nearest_enemy = math.inf
-        for w in S.warriors:
-            if w.id.side != M.my_side:
-                d = P.dist[target_region][w.region]
-                if not math.isinf(d) and d < dist_to_nearest_enemy:
-                    dist_to_nearest_enemy = d
-        if math.isinf(dist_to_nearest_enemy):
-            dist_to_nearest_enemy = 1000.0
+        # Turns to enemy HQ (hop distance)
+        turns_to_enemy_hq = P.hop_dist[target_region][M.opp_hq]
+        if turns_to_enemy_hq >= M.N:  # HOP_INF
+            turns_to_enemy_hq = 200  # MAX_TURN
 
         # Adjacent allies and enemies
         adj_allies_count = 0
@@ -372,26 +537,25 @@ class FeatureCalculator:
                     adj_allies_count += 1
                 else:
                     adj_enemies_count += 1
-        # Also count allies moving to same target? Maybe later, let's keep simple now.
 
         # Stronghold, HQ checks
         is_stronghold = target_region in M.strongholds
         is_hq_adjacent = target_region in M.adj[M.opp_hq]
         is_on_hq = target_region == M.opp_hq
 
-        # Move cost
+        # Move cost (binary: True if cost > 0)
         target_building = S.find_building(target_region)
-        move_cost = 0 if (target_building and target_building.side == M.my_side) else MOVE_COST
+        move_cost_val = 0 if (target_building and target_building.side == M.my_side) else MOVE_COST
+        move_cost = move_cost_val > 0
 
-        # Remaining turns
-        turns_remaining = 200 - turn
+        # Remaining turns (ratio)
+        turns_remaining = (200 - turn) / 200.0
 
-        # Remaining gold after action
-        remaining_gold_after_action = S.gold - move_cost
+        # Remaining gold after action (ratio)
+        remaining_gold_after_action = (S.gold - move_cost_val) / START_GOLD
 
         return MoveFeatures(
-            dist_to_enemy_hq=dist_to_enemy_hq,
-            dist_to_nearest_enemy=dist_to_nearest_enemy,
+            turns_to_enemy_hq=turns_to_enemy_hq,
             adj_allies_count=adj_allies_count,
             adj_enemies_count=adj_enemies_count,
             is_stronghold=is_stronghold,
@@ -407,9 +571,11 @@ class FeatureCalculator:
         S: GameState, M: GameMap, P: Paths, train_n: int, turn: int
     ) -> TrainFeatures:
         """Calculate features for a TRAIN action."""
-        train_cost = TRAIN_COST * train_n
-        turns_remaining = 200 - turn
-        remaining_gold_after_action = S.gold - train_cost
+
+        train_cost_val = TRAIN_COST * train_n
+        train_cost = train_cost_val / START_GOLD  # Ratio
+        turns_remaining = (200 - turn) / 200.0  # Ratio
+        remaining_gold_after_action = (S.gold - train_cost_val) / START_GOLD  # Ratio
 
         return TrainFeatures(
             train_n=train_n,
@@ -423,25 +589,27 @@ class FeatureCalculator:
         S: GameState, M: GameMap, P: Paths, region: int, turn: int
     ) -> UpgradeFeatures:
         """Calculate features for an UPGRADE action."""
+
         target_building = S.find_building(region)
         if target_building is None:
-            upgrade_cost = BASE_LEVELS[1].cost
+            upgrade_cost_val = BASE_LEVELS[1].cost
         elif target_building.type == BType.HQ:
             max_level = len(HQ_LEVELS) - 1
             if target_building.level < max_level:
-                upgrade_cost = target_building.upgrade_cost()
+                upgrade_cost_val = target_building.upgrade_cost()
             else:
-                upgrade_cost = 1000  # HQ heal cost
+                upgrade_cost_val = 1000  # HQ heal cost
         else:
             max_level = len(BASE_LEVELS) - 1
             if target_building.level < max_level:
-                upgrade_cost = target_building.upgrade_cost()
+                upgrade_cost_val = target_building.upgrade_cost()
             else:
-                upgrade_cost = 500  # Base heal cost
+                upgrade_cost_val = 500  # Base heal cost
 
+        upgrade_cost = upgrade_cost_val / START_GOLD  # Ratio
         is_stronghold = region in M.strongholds
-        turns_remaining = 200 - turn
-        remaining_gold_after_action = S.gold - upgrade_cost
+        turns_remaining = (200 - turn) / 200.0  # Ratio
+        remaining_gold_after_action = (S.gold - upgrade_cost_val) / START_GOLD  # Ratio
 
         return UpgradeFeatures(
             region=region,
@@ -809,6 +977,7 @@ def read_turn_result(S: GameState, M: GameMap, submitted: Actions) -> None:
 class Paths:
     dist: list[list[float]]
     nxt: list[list[int]]
+    hop_dist: list[list[int]]
 
 
 def euclid_ceil(M: GameMap, u: int, v: int) -> float:
@@ -818,30 +987,38 @@ def euclid_ceil(M: GameMap, u: int, v: int) -> float:
 def calculate_paths(M: GameMap) -> Paths:
     INF = math.inf
     N = M.N
+    HOP_INF = N  # hop 수의 최대값은 N-1을 넘지 않으므로 N으로 설정
     dist = [[INF] * N for _ in range(N)]
     nxt = [[-1] * N for _ in range(N)]
+    hop_dist = [[HOP_INF] * N for _ in range(N)]
 
     for i in range(N):
         dist[i][i] = 0.0
         nxt[i][i] = i
+        hop_dist[i][i] = 0
     for u in range(N):
         for v in M.adj[u]:
             w = euclid_ceil(M, u, v)
             if w < dist[u][v]:
                 dist[u][v] = w
+                hop_dist[u][v] = 1  # 인접 노드는 hop 수 1
 
     # Floyd-Warshall
     for k in range(N):
         dk = dist[k]
+        hk = hop_dist[k]
         for u in range(N):
             du = dist[u]
+            hu = hop_dist[u]
             duk = du[k]
+            huk = hu[k]
             if duk == INF:
                 continue
             for v in range(N):
-                cand = duk + dk[v]
-                if cand < du[v]:
-                    du[v] = cand
+                cand_dist = duk + dk[v]
+                if cand_dist < du[v]:
+                    du[v] = cand_dist
+                    hu[v] = huk + hk[v]
 
     for u in range(N):
         du = dist[u]
@@ -856,7 +1033,7 @@ def calculate_paths(M: GameMap) -> Paths:
                 if score < best_score:
                     best_score = score
                     nxt[u][v] = nb
-    return Paths(dist, nxt)
+    return Paths(dist, nxt, hop_dist)
 
 
 def next_step(P: Paths, u: int, v: int) -> int:
@@ -1111,12 +1288,6 @@ def generate_candidates(S: GameState, M: GameMap, P: Paths, turn: int) -> list[A
 # from action_selector import ActionSelector
 
 
-import sys
-
-def debug_print(msg):
-    """Print debug message to stderr to avoid interfering with stdout commands"""
-    print(msg, file=sys.stderr)
-
 def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
     """Strategy: use evaluation function to pick the best candidate actions."""
     weights = Weights()
@@ -1130,46 +1301,8 @@ def decide(S: GameState, M: GameMap, P: Paths, turn: int) -> Actions:
         "upkeep": calculate_upkeep(S, M),
     }
 
-    # Print all candidates, features, and scores (Forensics Evidence)
-    debug_print(f"[FORENSICS] === TURN {turn} ===")
-    candidates = CandidateGenerator.generate_all_candidates(S, M, P)
-    debug_print(f"[FORENSICS] Candidate Count: {len(candidates)}")
-    
-    candidate_scores = []
-    for idx, candidate in enumerate(candidates):
-        debug_print(f"\n[FORENSICS] --- Candidate #{idx} ---")
-        debug_print(f"[FORENSICS] Train N: {candidate.train_n}")
-        debug_print(f"[FORENSICS] Moves: {candidate.moves}")
-        debug_print(f"[FORENSICS] Upgrades: {candidate.upgrades}")
-        
-        # Calculate and print cost
-        cost = selector._calculate_candidate_cost(S, M, P, candidate)
-        debug_print(f"[FORENSICS] Cost: {cost}")
-        debug_print(f"[FORENSICS] Affordable: {S.gold >= cost}")
-        
-        if S.gold >= cost:
-            score = eval_fn.evaluate_actions(S, M, P, candidate, turn)
-            # Prefer doing something to doing nothing
-            if candidate.train_n > 0 or candidate.moves or candidate.upgrades:
-                score += 0.1
-            candidate_scores.append((score, idx, candidate))
-            debug_print(f"[FORENSICS] Score: {score}")
-        else:
-            candidate_scores.append((-math.inf, idx, candidate))
-            debug_print(f"[FORENSICS] Score: -inf (Not Affordable)")
-    
-    # Sort candidates by score descending
-    candidate_scores.sort(key=lambda x: (-x[0], x[1]))
-    debug_print(f"\n[FORENSICS] === Sorted Candidates ===")
-    for rank, (score, idx, candidate) in enumerate(candidate_scores):
-        debug_print(f"[FORENSICS] Rank {rank} | Candidate #{idx} | Score: {score} | Train: {candidate.train_n} | Moves: {len(candidate.moves)} | Upgrades: {len(candidate.upgrades)}")
-
     # Select best actions
     best_actions = selector.select_best_actions(S, M, P, turn)
-    debug_print(f"\n[FORENSICS] === FINAL CHOICE ===")
-    debug_print(f"[FORENSICS] Train: {best_actions.train_n}")
-    debug_print(f"[FORENSICS] Moves: {best_actions.moves}")
-    debug_print(f"[FORENSICS] Upgrades: {best_actions.upgrades}")
 
     # Log decision
     log_decision(turn, {
